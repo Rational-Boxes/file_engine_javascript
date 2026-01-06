@@ -1,0 +1,36 @@
+{
+  "name": "fileengine-grpc-client",
+  "version": "1.0.0",
+  "description": "JavaScript and TypeScript gRPC client for FileEngine virtual filesystem",
+  "main": "fileengine_grpc_client.js",
+  "types": "fileengine_grpc_client.d.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc"
+  },
+  "keywords": [
+    "grpc",
+    "filesystem",
+    "fileengine",
+    "typescript",
+    "javascript"
+  ],
+  "author": "FileEngine Team",
+  "license": "MIT",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.8.14",
+    "@grpc/proto-loader": "^0.7.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.1.0",
+    "typescript": "^5.0.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fileengine/fileengine-grpc-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fileengine/fileengine-grpc-client/issues"
+  },
+  "homepage": "https://github.com/fileengine/fileengine-grpc-client#readme"
+}
