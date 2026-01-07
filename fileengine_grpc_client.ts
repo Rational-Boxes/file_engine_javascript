@@ -399,7 +399,7 @@ const packageDefinition = protoLoader.loadSync(
   }
 );
 
-const fileengine_rpc = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
+const fileengine_rpc: any = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
 
 class FileEngineClient {
   private client: any;
