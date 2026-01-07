@@ -2,11 +2,12 @@
   "name": "fileengine-grpc-client",
   "version": "1.0.0",
   "description": "JavaScript and TypeScript gRPC client for FileEngine virtual filesystem",
-  "main": "fileengine_grpc_client.js",
-  "types": "fileengine_grpc_client.d.ts",
+  "main": "dist/fileengine_grpc_client.js",
+  "types": "dist/fileengine_grpc_client.d.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "build": "tsc"
+    "build": "tsc",
+    "dev": "tsc --watch"
   },
   "keywords": [
     "grpc",
