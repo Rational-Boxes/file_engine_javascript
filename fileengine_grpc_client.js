@@ -1,8 +1,26 @@
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
+const fs = require('fs');
+const path = require('path');
 
-// Load the proto file
-const PROTO_PATH = __dirname + '/../file_engine_core/proto/fileservice.proto';
+// Load the proto file (canonical `fileengine` protocol from the C++ server).
+// Resolve across run-from-source and packaged layouts.
+function resolveProtoPath() {
+  const candidates = [
+    path.join(__dirname, '../file_engine_cpp/proto/fileservice.proto'),
+    path.join(__dirname, '../../file_engine_cpp/proto/fileservice.proto'),
+    path.join(__dirname, 'fileservice.proto'),
+    path.join(__dirname, '../fileservice.proto')
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return candidates[0];
+}
+
+const PROTO_PATH = resolveProtoPath();
 
 const packageDefinition = protoLoader.loadSync(
   PROTO_PATH,
@@ -15,17 +33,18 @@ const packageDefinition = protoLoader.loadSync(
   }
 );
 
-const fileengine_rpc = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
+const fileengine = grpc.loadPackageDefinition(packageDefinition).fileengine;
 
 class FileEngineClient {
   constructor(serverAddress = 'localhost:50051') {
-    this.client = new fileengine_rpc.FileService(
+    this.client = new fileengine.FileService(
       serverAddress,
       grpc.credentials.createInsecure()
     );
   }
 
-  // Helper function to create auth context
+  // Helper function to create the trusted-access auth context. User identity is
+  // resolved by the front-end adapter and passed through verbatim.
   createAuthContext(user, roles = [], tenant = 'default', claims = {}) {
     return {
       user,
@@ -41,8 +60,7 @@ class FileEngineClient {
       const request = {
         parent_uid: parentUid,
         name,
-        auth: this.createAuthContext(user, [], tenant),
-        permissions: 0o755
+        auth: this.createAuthContext(user, [], tenant)
       };
 
       this.client.MakeDirectory(request, (error, response) => {
@@ -72,11 +90,12 @@ class FileEngineClient {
     });
   }
 
-  listDirectory(uid, user, tenant = 'default') {
+  listDirectory(uid, user, includeDeleted = false, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
-        auth: this.createAuthContext(user, [], tenant)
+        auth: this.createAuthContext(user, [], tenant),
+        include_deleted: includeDeleted
       };
 
       this.client.ListDirectory(request, (error, response) => {
@@ -89,25 +108,8 @@ class FileEngineClient {
     });
   }
 
-  listDirectoryWithDeleted(uid, user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.ListDirectoryWithDeleted(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
   // File operations
-  touch(parentUid, name, user, tenant = 'default') {
+  createFile(parentUid, name, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         parent_uid: parentUid,
@@ -115,7 +117,7 @@ class FileEngineClient {
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Touch(request, (error, response) => {
+      this.client.CreateFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -125,14 +127,14 @@ class FileEngineClient {
     });
   }
 
-  removeFile(uid, user, tenant = 'default') {
+  deleteFile(uid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.RemoveFile(request, (error, response) => {
+      this.client.DeleteFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -159,7 +161,7 @@ class FileEngineClient {
     });
   }
 
-  putFile(uid, data, user, tenant = 'default') {
+  writeFile(uid, data, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
@@ -167,7 +169,7 @@ class FileEngineClient {
         data: Buffer.isBuffer(data) ? data : Buffer.from(data)
       };
 
-      this.client.PutFile(request, (error, response) => {
+      this.client.WriteFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -177,15 +179,14 @@ class FileEngineClient {
     });
   }
 
-  getFile(uid, user, versionTimestamp = null, tenant = 'default') {
+  readFile(uid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
-        version_timestamp: versionTimestamp,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.GetFile(request, (error, response) => {
+      this.client.ReadFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -196,14 +197,14 @@ class FileEngineClient {
   }
 
   // File information
-  stat(uid, user, tenant = 'default') {
+  getFileInfo(uid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Stat(request, (error, response) => {
+      this.client.GetFileInfo(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -213,14 +214,14 @@ class FileEngineClient {
     });
   }
 
-  exists(uid, user, tenant = 'default') {
+  fileExists(uid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Exists(request, (error, response) => {
+      this.client.FileExists(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -231,7 +232,7 @@ class FileEngineClient {
   }
 
   // File manipulation operations
-  rename(uid, newName, user, tenant = 'default') {
+  renameFile(uid, newName, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
@@ -239,7 +240,7 @@ class FileEngineClient {
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Rename(request, (error, response) => {
+      this.client.RenameFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -249,15 +250,15 @@ class FileEngineClient {
     });
   }
 
-  move(sourceUid, destinationParentUid, user, tenant = 'default') {
+  moveFile(sourceUid, destinationUid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         source_uid: sourceUid,
-        destination_parent_uid: destinationParentUid,
+        destination_uid: destinationUid,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Move(request, (error, response) => {
+      this.client.MoveFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -267,15 +268,15 @@ class FileEngineClient {
     });
   }
 
-  copy(sourceUid, destinationParentUid, user, tenant = 'default') {
+  copyFile(sourceUid, destinationUid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         source_uid: sourceUid,
-        destination_parent_uid: destinationParentUid,
+        destination_uid: destinationUid,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.Copy(request, (error, response) => {
+      this.client.CopyFile(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -303,7 +304,7 @@ class FileEngineClient {
     });
   }
 
-  getVersion(uid, versionTimestamp, user, tenant = 'default') {
+  readVersion(uid, versionTimestamp, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
@@ -311,25 +312,7 @@ class FileEngineClient {
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.GetVersion(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  restoreToVersion(uid, versionTimestamp, user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        uid,
-        version_timestamp: versionTimestamp,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.RestoreToVersion(request, (error, response) => {
+      this.client.ReadVersion(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -412,11 +395,11 @@ class FileEngineClient {
     });
   }
 
-  getMetadataForVersion(uid, versionTimestamp, key, user, tenant = 'default') {
+  getMetadataForVersion(uid, version, key, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
-        version_timestamp: versionTimestamp,
+        version,
         key,
         auth: this.createAuthContext(user, [], tenant)
       };
@@ -431,11 +414,11 @@ class FileEngineClient {
     });
   }
 
-  getAllMetadataForVersion(uid, versionTimestamp, user, tenant = 'default') {
+  getAllMetadataForVersion(uid, version, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
-        version_timestamp: versionTimestamp,
+        version,
         auth: this.createAuthContext(user, [], tenant)
       };
 
@@ -449,107 +432,33 @@ class FileEngineClient {
     });
   }
 
+  // Path resolution
+  resolvePath(filePath, user, tenant = 'default') {
+    return new Promise((resolve, reject) => {
+      const request = {
+        path: filePath,
+        auth: this.createAuthContext(user, [], tenant)
+      };
+
+      this.client.ResolvePath(request, (error, response) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  }
+
   // ACL operations
-  grantPermission(resourceUid, principal, permission, user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        resource_uid: resourceUid,
-        principal,
-        permission,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.GrantPermission(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  revokePermission(resourceUid, principal, permission, user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        resource_uid: resourceUid,
-        principal,
-        permission,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.RevokePermission(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  checkPermission(resourceUid, requiredPermission, user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        resource_uid: resourceUid,
-        required_permission: requiredPermission,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.CheckPermission(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  // Administrative operations
-  getStorageUsage(user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        auth: this.createAuthContext(user, [], tenant),
-        tenant
-      };
-
-      this.client.GetStorageUsage(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  purgeOldVersions(uid, keepCount, user, tenant = 'default') {
+  evaluateACL(uid, user, tenant = 'default') {
     return new Promise((resolve, reject) => {
       const request = {
         uid,
-        keep_count: keepCount,
         auth: this.createAuthContext(user, [], tenant)
       };
 
-      this.client.PurgeOldVersions(request, (error, response) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
-  }
-
-  triggerSync(user, tenant = 'default') {
-    return new Promise((resolve, reject) => {
-      const request = {
-        tenant,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.TriggerSync(request, (error, response) => {
+      this.client.EvaluateACL(request, (error, response) => {
         if (error) {
           reject(error);
         } else {
@@ -561,3 +470,4 @@ class FileEngineClient {
 }
 
 module.exports = FileEngineClient;
+module.exports.default = FileEngineClient;

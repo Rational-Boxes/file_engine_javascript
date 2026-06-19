@@ -66,6 +66,10 @@ All operations require an authentication context with:
 - `roles`: Array of user roles (optional)
 - `claims`: Additional user claims (optional)
 
+> This client targets the `fileengine` protocol defined in
+> `file_engine_cpp/proto/fileservice.proto`. Method names mirror the service
+> RPCs (`CreateFile`, `WriteFile`, `ReadFile`, `MoveFile`, etc.).
+
 ### Directory Operations
 
 #### makeDirectory(parentUid, name, user, tenant = 'default')
@@ -74,58 +78,58 @@ Creates a new directory.
 #### removeDirectory(uid, user, tenant = 'default')
 Removes a directory.
 
-#### listDirectory(uid, user, tenant = 'default')
-Lists the contents of a directory.
-
-#### listDirectoryWithDeleted(uid, user, tenant = 'default')
-Lists the contents of a directory including deleted files.
+#### listDirectory(uid, user, includeDeleted = false, tenant = 'default')
+Lists the contents of a directory. Pass `includeDeleted = true` to include
+soft-deleted entries.
 
 ### File Operations
 
-#### touch(parentUid, name, user, tenant = 'default')
+#### createFile(parentUid, name, user, tenant = 'default')
 Creates an empty file.
 
-#### removeFile(uid, user, tenant = 'default')
-Removes a file.
+#### deleteFile(uid, user, tenant = 'default')
+Deletes a file.
 
 #### undeleteFile(uid, user, tenant = 'default')
 Undeletes a file.
 
-#### putFile(uid, data, user, tenant = 'default')
-Uploads data to a file.
+#### writeFile(uid, data, user, tenant = 'default')
+Writes data to a file (creates a new version).
 
-#### getFile(uid, user, versionTimestamp = null, tenant = 'default')
-Downloads data from a file.
+#### readFile(uid, user, tenant = 'default')
+Reads the latest content of a file.
 
 ### File Information
 
-#### stat(uid, user, tenant = 'default')
+#### getFileInfo(uid, user, tenant = 'default')
 Gets file or directory information.
 
-#### exists(uid, user, tenant = 'default')
+#### fileExists(uid, user, tenant = 'default')
 Checks if a file or directory exists.
 
 ### File Manipulation
 
-#### rename(uid, newName, user, tenant = 'default')
+#### renameFile(uid, newName, user, tenant = 'default')
 Renames a file or directory.
 
-#### move(sourceUid, destinationParentUid, user, tenant = 'default')
-Moves a file or directory.
+#### moveFile(sourceUid, destinationUid, user, tenant = 'default')
+Moves a file or directory into the destination directory.
 
-#### copy(sourceUid, destinationParentUid, user, tenant = 'default')
-Copies a file or directory.
+#### copyFile(sourceUid, destinationUid, user, tenant = 'default')
+Copies a file or directory into the destination directory.
 
 ### Version Operations
 
 #### listVersions(uid, user, tenant = 'default')
-Lists all versions of a file.
+Lists all version timestamps of a file.
 
-#### getVersion(uid, versionTimestamp, user, tenant = 'default')
-Gets a specific version of a file.
+#### readVersion(uid, versionTimestamp, user, tenant = 'default')
+Reads a specific version of a file by its timestamp.
 
-#### restoreToVersion(uid, versionTimestamp, user, tenant = 'default')
-Restores a file to a specific version.
+### Path Resolution
+
+#### resolvePath(path, user, tenant = 'default')
+Resolves an absolute path to its UID and type (`{ success, uid, type }`).
 
 ### Metadata Operations
 
@@ -136,51 +140,27 @@ Sets metadata for a resource.
 Gets specific metadata for a resource.
 
 #### getAllMetadata(uid, user, tenant = 'default')
-Gets all metadata for a resource.
+Gets all metadata for a resource (returns `metadata` as an array of
+`{ key, value }` entries).
 
 #### deleteMetadata(uid, key, user, tenant = 'default')
 Deletes specific metadata for a resource.
 
-#### getMetadataForVersion(uid, versionTimestamp, key, user, tenant = 'default')
-Gets specific metadata for a specific version of a resource.
+#### getMetadataForVersion(uid, version, key, user, tenant = 'default')
+Gets specific metadata for a version of a resource (`version` is a numeric
+version index).
 
-#### getAllMetadataForVersion(uid, versionTimestamp, user, tenant = 'default')
-Gets all metadata for a specific version of a resource.
+#### getAllMetadataForVersion(uid, version, user, tenant = 'default')
+Gets all metadata for a version of a resource (`version` is a numeric version
+index).
 
 ### ACL Operations
 
-#### grantPermission(resourceUid, principal, permission, user, tenant = 'default')
-Grants a permission to a principal on a resource.
-
-#### revokePermission(resourceUid, principal, permission, user, tenant = 'default')
-Revokes a permission from a principal on a resource.
-
-#### checkPermission(resourceUid, requiredPermission, user, tenant = 'default')
-Checks if a user has a specific permission on a resource.
-
-### Administrative Operations
-
-#### getStorageUsage(user, tenant = 'default')
-Gets storage usage statistics.
-
-#### purgeOldVersions(uid, keepCount, user, tenant = 'default')
-Purges old versions of a file, keeping only the specified number.
-
-#### triggerSync(user, tenant = 'default')
-Triggers synchronization.
-
-## Permissions
-
-The following permissions are available:
-- `Permission.READ` - Read permission
-- `Permission.WRITE` - Write permission
-- `Permission.DELETE` - Delete permission
-- `Permission.LIST_DELETED` - List deleted items permission
-- `Permission.UNDELETE` - Undelete permission
-- `Permission.VIEW_VERSIONS` - View versions permission
-- `Permission.RETRIEVE_BACK_VERSION` - Retrieve back version permission
-- `Permission.RESTORE_TO_VERSION` - Restore to version permission
-- `Permission.EXECUTE` - Execute permission
+#### evaluateACL(uid, user, tenant = 'default')
+Evaluates the effective permissions for the principal on a resource. Returns
+`{ success, permissions }`, where `permissions` is an array of permission
+strings. The `fileengine` protocol exposes ACL evaluation only; ACL mutation
+(grant/revoke) is handled outside this service.
 
 ## Examples
 
@@ -196,15 +176,15 @@ async function createDirAndFile() {
     console.log('Directory created:', dirResponse.uid);
 
     // Create a file in the directory
-    const fileResponse = await client.touch(dirResponse.uid, 'my_file.txt', 'root');
+    const fileResponse = await client.createFile(dirResponse.uid, 'my_file.txt', 'root');
     console.log('File created:', fileResponse.uid);
 
     // Write data to the file
-    await client.putFile(fileResponse.uid, 'Hello, FileEngine!', 'root');
+    await client.writeFile(fileResponse.uid, 'Hello, FileEngine!', 'root');
     console.log('Data written to file');
 
     // Read data from the file
-    const readResponse = await client.getFile(fileResponse.uid, 'root');
+    const readResponse = await client.readFile(fileResponse.uid, 'root');
     console.log('File content:', readResponse.data.toString());
   } catch (error) {
     console.error('Error:', error);
@@ -222,7 +202,7 @@ const client = new FileEngineClient();
 async function metadataExample() {
   try {
     // Create a file
-    const fileResponse = await client.touch('', 'metadata_example.txt', 'root');
+    const fileResponse = await client.createFile('', 'metadata_example.txt', 'root');
     const fileUid = fileResponse.uid;
 
     // Set metadata
