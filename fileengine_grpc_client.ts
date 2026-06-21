@@ -1,788 +1,471 @@
+/**
+ * FileEngine gRPC client (TypeScript).
+ *
+ * Targets the canonical `fileengine_rpc` protocol defined in
+ * `file_engine_core/proto/fileservice.proto`. Exposes a filesystem-like API
+ * equivalent to the Python `ManagedFiles` client.
+ *
+ * Administration is role-based: pass the `system_admin` role to authorize
+ * root-level creation and ACL/role management. The filesystem root may be
+ * referenced as the empty string `""` or the all-zeros UUID.
+ */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import * as fs from 'fs';
 import * as path from 'path';
+import * as fs from 'fs';
 
-// TypeScript interfaces mirroring file_engine_cpp/proto/fileservice.proto
-// (package `fileengine`, service `FileService`).
+export const ROOT_UID = '';
+export const ZERO_UID = '00000000-0000-0000-0000-000000000000';
 
-interface AuthContext {
+// ----------------------------- typed models ------------------------------ //
+export type FileTypeName = 'REGULAR_FILE' | 'DIRECTORY' | 'SYMLINK';
+export type PermissionName =
+  | 'READ' | 'WRITE' | 'DELETE' | 'LIST_DELETED' | 'UNDELETE' | 'VIEW_VERSIONS'
+  | 'RETRIEVE_BACK_VERSION' | 'RESTORE_TO_VERSION' | 'EXECUTE' | 'MANAGE_ACL'
+  | 'ACL_INHERIT';
+export type AclEffectName = 'ALLOW' | 'DENY';
+
+export interface AuthenticationContext {
   user: string;
   roles: string[];
   tenant: string;
   claims: { [key: string]: string };
 }
 
-// Mirrors the proto `ProtoFileType` enum. proto-loader is configured with
-// `enums: String`, so values are carried on the wire as the enum names.
-enum ProtoFileType {
-  PROTO_REGULAR_FILE = 'PROTO_REGULAR_FILE',
-  PROTO_DIRECTORY = 'PROTO_DIRECTORY'
-}
-
-interface ProtoFileInfo {
+export interface FileInfo {
   uid: string;
-  path: string;
   name: string;
-  type: ProtoFileType;
+  parentUid: string;
+  type: FileTypeName;
   size: number;
-  created_at: number;
-  modified_at: number;
-  version: string;
   owner: string;
   permissions: number;
+  createdAt: Date | null;
+  modifiedAt: Date | null;
+  version: string;
+  isDir: boolean;
 }
 
-interface ProtoDirectoryEntry {
+export interface DirectoryEntry {
   uid: string;
   name: string;
-  type: ProtoFileType;
+  type: FileTypeName;
   size: number;
-  created_at: number;
-  modified_at: number;
-  version_count: number;
+  createdAt: Date | null;
+  modifiedAt: Date | null;
+  versionCount: number;
+  isContainer: boolean;
 }
 
-interface MetadataEntry {
-  key: string;
-  value: string;
-}
-
-// Directory operations
-interface MakeDirectoryRequest {
-  parent_uid: string;
+export interface Revision {
+  version: string;
   name: string;
-  auth: AuthContext;
+  user: string;
 }
 
-interface MakeDirectoryResponse {
-  success: boolean;
-  error?: string;
-  uid?: string;
+export interface StorageUsage {
+  totalSpace: number;
+  usedSpace: number;
+  availableSpace: number;
+  usagePercentage: number;
 }
 
-interface RemoveDirectoryRequest {
-  uid: string;
-  auth: AuthContext;
+export interface ClientOptions {
+  serverAddress?: string;
+  userName?: string;
+  userRoles?: string[];
+  tenant?: string;
+  userClaims?: string[] | { [key: string]: string };
 }
 
-interface RemoveDirectoryResponse {
-  success: boolean;
-  error?: string;
+const PERM_LETTERS: { [k: string]: PermissionName } = {
+  r: 'READ', w: 'WRITE', x: 'EXECUTE', d: 'DELETE', l: 'LIST_DELETED',
+  u: 'UNDELETE', v: 'VIEW_VERSIONS', b: 'RETRIEVE_BACK_VERSION',
+  s: 'RESTORE_TO_VERSION', m: 'MANAGE_ACL', i: 'ACL_INHERIT',
+};
+
+function coercePermission(p: PermissionName | string): string {
+  if (p.length === 1 && PERM_LETTERS[p.toLowerCase()]) return PERM_LETTERS[p.toLowerCase()];
+  return p.toUpperCase();
 }
 
-interface ListDirectoryRequest {
-  uid: string;
-  auth: AuthContext;
-  include_deleted: boolean;
+function coerceEffect(e: AclEffectName | string): string {
+  return String(e).toUpperCase() === 'DENY' ? 'DENY' : 'ALLOW';
 }
 
-interface ListDirectoryResponse {
-  success: boolean;
-  error?: string;
-  entries: ProtoDirectoryEntry[];
+/** Convert a server epoch-seconds value to a Date, tolerating the
+ *  out-of-range / wrong-unit values some entries carry. Returns null if the
+ *  value cannot be interpreted as a sane timestamp. */
+function safeDate(ts: number | string | undefined | null): Date | null {
+  const n = typeof ts === 'string' ? Number(ts) : ts;
+  if (!n || !isFinite(n)) return null;
+  for (const div of [1, 1e3, 1e6, 1e9]) {
+    const d = new Date((n / div) * 1000);
+    const year = d.getUTCFullYear();
+    if (year >= 1970 && year <= 9999) return d;
+  }
+  return null;
 }
 
-// File operations
-interface CreateFileRequest {
-  parent_uid: string;
-  name: string;
-  auth: AuthContext;
-}
-
-interface CreateFileResponse {
-  success: boolean;
-  error?: string;
-  uid?: string;
-}
-
-interface DeleteFileRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface DeleteFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface UndeleteFileRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface UndeleteFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface WriteFileRequest {
-  uid: string;
-  auth: AuthContext;
-  data: Buffer;
-}
-
-interface WriteFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface ReadFileRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface ReadFileResponse {
-  success: boolean;
-  error?: string;
-  data?: Buffer;
-}
-
-interface GetFileInfoRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface GetFileInfoResponse {
-  success: boolean;
-  error?: string;
-  info?: ProtoFileInfo;
-}
-
-interface FileExistsRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface FileExistsResponse {
-  success: boolean;
-  error?: string;
-  exists: boolean;
-}
-
-// File manipulation
-interface MoveFileRequest {
-  source_uid: string;
-  destination_uid: string;
-  auth: AuthContext;
-}
-
-interface MoveFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface CopyFileRequest {
-  source_uid: string;
-  destination_uid: string;
-  auth: AuthContext;
-}
-
-interface CopyFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface RenameFileRequest {
-  uid: string;
-  new_name: string;
-  auth: AuthContext;
-}
-
-interface RenameFileResponse {
-  success: boolean;
-  error?: string;
-}
-
-// Version control
-interface ListVersionsRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface ListVersionsResponse {
-  success: boolean;
-  error?: string;
-  versions: string[];
-}
-
-interface ReadVersionRequest {
-  uid: string;
-  version_timestamp: string;
-  auth: AuthContext;
-}
-
-interface ReadVersionResponse {
-  success: boolean;
-  error?: string;
-  data?: Buffer;
-}
-
-// Metadata operations
-interface SetMetadataRequest {
-  uid: string;
-  key: string;
-  value: string;
-  auth: AuthContext;
-}
-
-interface SetMetadataResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface GetMetadataRequest {
-  uid: string;
-  key: string;
-  auth: AuthContext;
-}
-
-interface GetMetadataResponse {
-  success: boolean;
-  error?: string;
-  value?: string;
-}
-
-interface GetAllMetadataRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface GetAllMetadataResponse {
-  success: boolean;
-  error?: string;
-  metadata: MetadataEntry[];
-}
-
-interface DeleteMetadataRequest {
-  uid: string;
-  key: string;
-  auth: AuthContext;
-}
-
-interface DeleteMetadataResponse {
-  success: boolean;
-  error?: string;
-}
-
-interface GetMetadataForVersionRequest {
-  uid: string;
-  version: number;
-  key: string;
-  auth: AuthContext;
-}
-
-interface GetMetadataForVersionResponse {
-  success: boolean;
-  error?: string;
-  value?: string;
-}
-
-interface GetAllMetadataForVersionRequest {
-  uid: string;
-  version: number;
-  auth: AuthContext;
-}
-
-interface GetAllMetadataForVersionResponse {
-  success: boolean;
-  error?: string;
-  metadata: MetadataEntry[];
-}
-
-// Path resolution
-interface ResolvePathRequest {
-  path: string;
-  auth: AuthContext;
-}
-
-interface ResolvePathResponse {
-  success: boolean;
-  error?: string;
-  uid?: string;
-  type?: ProtoFileType;
-}
-
-// ACL operations
-interface EvaluateACLRequest {
-  uid: string;
-  auth: AuthContext;
-}
-
-interface EvaluateACLResponse {
-  success: boolean;
-  error?: string;
-  permissions: string[];
-}
-
-// Load the proto file (canonical fileengine protocol from the C++ server).
-// Resolve across run-from-source (root) and compiled (dist/) layouts, plus a
-// proto bundled alongside the client (e.g. RPM-packaged deployments).
 function resolveProtoPath(): string {
   const candidates = [
-    path.join(__dirname, '../file_engine_cpp/proto/fileservice.proto'),
-    path.join(__dirname, '../../file_engine_cpp/proto/fileservice.proto'),
-    path.join(__dirname, 'fileservice.proto'),
-    path.join(__dirname, '../fileservice.proto')
+    path.join(__dirname, 'fileservice.proto'),        // bundled alongside source
+    path.join(__dirname, '..', 'fileservice.proto'),  // when compiled into dist/
+    path.join(__dirname, '..', '..', 'file_engine_core', 'proto', 'fileservice.proto'),
   ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
   }
   return candidates[0];
 }
 
-const PROTO_PATH = resolveProtoPath();
+const packageDefinition = protoLoader.loadSync(resolveProtoPath(), {
+  keepCase: true,
+  longs: Number,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+});
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const proto: any = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
 
-const packageDefinition = protoLoader.loadSync(
-  PROTO_PATH,
-  {
-    keepCase: true,
-    longs: String,
-    enums: String,
-    defaults: true,
-    oneofs: true
-  }
-);
-
-const fileengine: any = grpc.loadPackageDefinition(packageDefinition).fileengine;
-
-class FileEngineClient {
+/**
+ * High-level FileEngine client, equivalent to the Python `ManagedFiles`.
+ * Stores a default user/roles/tenant/claims used for every call (overridable
+ * per call). Methods resolve to friendly values (uid string, Buffer, typed
+ * models) or `false`/`null`/`[]` on error.
+ */
+export class FileEngineClient {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private client: any;
+  private user: string;
+  private roles: string[];
+  private tenant: string;
+  private claims: { [key: string]: string };
 
-  constructor(serverAddress: string = 'localhost:50051') {
-    this.client = new fileengine.FileService(
-      serverAddress,
-      grpc.credentials.createInsecure()
+  constructor(options: ClientOptions | string = {}) {
+    const opts: ClientOptions = typeof options === 'string' ? { serverAddress: options } : options;
+    this.user = opts.userName || 'user';
+    this.roles = opts.userRoles || [];
+    this.tenant = opts.tenant ?? '';
+    this.claims = {};
+    if (Array.isArray(opts.userClaims)) {
+      for (const c of opts.userClaims) this.claims[c] = c;
+    } else if (opts.userClaims) {
+      this.claims = { ...opts.userClaims };
+    }
+    this.client = new proto.FileService(
+      opts.serverAddress || 'localhost:50051',
+      grpc.credentials.createInsecure(),
     );
   }
 
-  // Helper function to create the trusted-access auth context. User identity
-  // is resolved by the front-end adapter and passed through verbatim.
-  private createAuthContext(user: string, roles: string[] = [], tenant: string = 'default', claims: { [key: string]: string } = {}): AuthContext {
+  close(): void {
+    grpc.closeClient(this.client);
+  }
+
+  setUserInformation(userName?: string, roles?: string[], claims?: string[]): void {
+    if (userName) this.user = userName;
+    if (roles) this.roles = roles;
+    if (claims) { this.claims = {}; for (const c of claims) this.claims[c] = c; }
+  }
+
+  private auth(user?: string, roles?: string[], tenant?: string, claims?: { [k: string]: string }): AuthenticationContext {
     return {
-      user,
-      roles,
-      tenant,
-      claims
+      user: user || this.user,
+      roles: roles || this.roles,
+      tenant: tenant ?? this.tenant,
+      claims: claims || this.claims,
     };
   }
 
-  // Directory operations
-  makeDirectory(parentUid: string, name: string, user: string, tenant: string = 'default'): Promise<MakeDirectoryResponse> {
-    return new Promise((resolve, reject) => {
-      const request: MakeDirectoryRequest = {
-        parent_uid: parentUid,
-        name,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.MakeDirectory(request, (error: grpc.ServiceError, response: MakeDirectoryResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private call<TRes = any>(method: string, request: object): Promise<TRes> {
+    return new Promise<TRes>((resolve, reject) => {
+      this.client[method](request, (err: grpc.ServiceError | null, response: TRes) => {
+        if (err) reject(err); else resolve(response);
       });
     });
   }
 
-  removeDirectory(uid: string, user: string, tenant: string = 'default'): Promise<RemoveDirectoryResponse> {
-    return new Promise((resolve, reject) => {
-      const request: RemoveDirectoryRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.RemoveDirectory(request, (error: grpc.ServiceError, response: RemoveDirectoryResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  // --------------------------- directory ops --------------------------- //
+  async mkdir(parentUid: string, name: string): Promise<string | false> {
+    try {
+      const r = await this.call('MakeDirectory', { parent_uid: parentUid, name, auth: this.auth() });
+      return r.success ? r.uid : false;
+    } catch { return false; }
   }
 
-  listDirectory(uid: string, user: string, includeDeleted: boolean = false, tenant: string = 'default'): Promise<ListDirectoryResponse> {
-    return new Promise((resolve, reject) => {
-      const request: ListDirectoryRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant),
-        include_deleted: includeDeleted
-      };
-
-      this.client.ListDirectory(request, (error: grpc.ServiceError, response: ListDirectoryResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async dir(uid: string, showDeleted = false): Promise<DirectoryEntry[] | false> {
+    try {
+      const method = showDeleted ? 'ListDirectoryWithDeleted' : 'ListDirectory';
+      const r = await this.call(method, { uid, auth: this.auth() });
+      if (!r.success) return false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (r.entries || []).map((e: any): DirectoryEntry => ({
+        uid: e.uid,
+        name: e.name,
+        type: e.type as FileTypeName,
+        size: Number(e.size) || 0,
+        createdAt: safeDate(e.created_at),
+        modifiedAt: safeDate(e.modified_at),
+        versionCount: Number(e.version_count) || 0,
+        isContainer: e.type === 'DIRECTORY',
+      }));
+    } catch { return false; }
   }
 
-  // File operations
-  createFile(parentUid: string, name: string, user: string, tenant: string = 'default'): Promise<CreateFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: CreateFileRequest = {
-        parent_uid: parentUid,
-        name,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.CreateFile(request, (error: grpc.ServiceError, response: CreateFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  listDeleted(uid: string): Promise<DirectoryEntry[] | false> {
+    return this.dir(uid, true);
   }
 
-  deleteFile(uid: string, user: string, tenant: string = 'default'): Promise<DeleteFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: DeleteFileRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.DeleteFile(request, (error: grpc.ServiceError, response: DeleteFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  // ------------------------------ file ops ----------------------------- //
+  async touch(parentUid: string, name: string): Promise<string | false> {
+    try {
+      const r = await this.call('Touch', { parent_uid: parentUid, name, auth: this.auth() });
+      return r.success ? r.uid : false;
+    } catch { return false; }
   }
 
-  undeleteFile(uid: string, user: string, tenant: string = 'default'): Promise<UndeleteFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: UndeleteFileRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.UndeleteFile(request, (error: grpc.ServiceError, response: UndeleteFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async put(uid: string, payload: Buffer | string | null): Promise<number | false> {
+    const data = payload == null ? Buffer.alloc(0) : (typeof payload === 'string' ? Buffer.from(payload) : payload);
+    try {
+      const r = await this.call('PutFile', { uid, data, auth: this.auth() });
+      return r.success ? Date.now() / 1000 : false;
+    } catch { return false; }
   }
 
-  writeFile(uid: string, data: Buffer | string, user: string, tenant: string = 'default'): Promise<WriteFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: WriteFileRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant),
-        data: Buffer.isBuffer(data) ? data : Buffer.from(data)
-      };
-
-      this.client.WriteFile(request, (error: grpc.ServiceError, response: WriteFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async get(uid: string, back = 0): Promise<Buffer | false> {
+    try {
+      if (back === 0) {
+        const r = await this.call('GetFile', { uid, auth: this.auth() });
+        return r.success ? Buffer.from(r.data) : false;
+      }
+      const versions = await this.revisions(uid);
+      if (versions.length <= back) return false;
+      const r = await this.call('GetVersion', { uid, version_timestamp: versions[back].version, auth: this.auth() });
+      return r.success ? Buffer.from(r.data) : false;
+    } catch { return false; }
   }
 
-  readFile(uid: string, user: string, tenant: string = 'default'): Promise<ReadFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: ReadFileRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.ReadFile(request, (error: grpc.ServiceError, response: ReadFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async exists(uid: string): Promise<boolean> {
+    try {
+      const r = await this.call('Exists', { uid, auth: this.auth() });
+      return Boolean(r.success && r.exists);
+    } catch { return false; }
   }
 
-  // File information
-  getFileInfo(uid: string, user: string, tenant: string = 'default'): Promise<GetFileInfoResponse> {
-    return new Promise((resolve, reject) => {
-      const request: GetFileInfoRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
+  async stat(uid: string): Promise<FileInfo | null> {
+    try {
+      const r = await this.call('Stat', { uid, auth: this.auth() });
+      if (!r.success) return null;
+      const i = r.info;
+      return {
+        uid: i.uid,
+        name: i.name,
+        parentUid: i.parent_uid || '',
+        type: i.type as FileTypeName,
+        size: Number(i.size) || 0,
+        owner: i.owner || '',
+        permissions: Number(i.permissions) || 0,
+        createdAt: safeDate(i.created_at),
+        modifiedAt: safeDate(i.modified_at),
+        version: i.version || '',
+        isDir: i.type === 'DIRECTORY',
       };
-
-      this.client.GetFileInfo(request, (error: grpc.ServiceError, response: GetFileInfoResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+    } catch { return null; }
   }
 
-  fileExists(uid: string, user: string, tenant: string = 'default'): Promise<FileExistsResponse> {
-    return new Promise((resolve, reject) => {
-      const request: FileExistsRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.FileExists(request, (error: grpc.ServiceError, response: FileExistsResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async isDir(uid: string): Promise<boolean> {
+    const info = await this.stat(uid);
+    return Boolean(info && info.isDir);
   }
 
-  // File manipulation operations
-  renameFile(uid: string, newName: string, user: string, tenant: string = 'default'): Promise<RenameFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: RenameFileRequest = {
-        uid,
-        new_name: newName,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.RenameFile(request, (error: grpc.ServiceError, response: RenameFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async getParent(uid: string): Promise<string> {
+    const info = await this.stat(uid);
+    return info ? info.parentUid : '';
   }
 
-  moveFile(sourceUid: string, destinationUid: string, user: string, tenant: string = 'default'): Promise<MoveFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: MoveFileRequest = {
-        source_uid: sourceUid,
-        destination_uid: destinationUid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.MoveFile(request, (error: grpc.ServiceError, response: MoveFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async fileName(uid: string): Promise<string[]> {
+    const info = await this.stat(uid);
+    return info ? [info.name] : [];
   }
 
-  copyFile(sourceUid: string, destinationUid: string, user: string, tenant: string = 'default'): Promise<CopyFileResponse> {
-    return new Promise((resolve, reject) => {
-      const request: CopyFileRequest = {
-        source_uid: sourceUid,
-        destination_uid: destinationUid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.CopyFile(request, (error: grpc.ServiceError, response: CopyFileResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async getFileMtime(uid: string): Promise<Date | null> {
+    const info = await this.stat(uid);
+    return info ? info.modifiedAt : null;
   }
 
-  // Version operations
-  listVersions(uid: string, user: string, tenant: string = 'default'): Promise<ListVersionsResponse> {
-    return new Promise((resolve, reject) => {
-      const request: ListVersionsRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.ListVersions(request, (error: grpc.ServiceError, response: ListVersionsResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async getFolderCdate(uid: string): Promise<Date | null> {
+    const info = await this.stat(uid);
+    return info ? info.createdAt : null;
   }
 
-  readVersion(uid: string, versionTimestamp: string, user: string, tenant: string = 'default'): Promise<ReadVersionResponse> {
-    return new Promise((resolve, reject) => {
-      const request: ReadVersionRequest = {
-        uid,
-        version_timestamp: versionTimestamp,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.ReadVersion(request, (error: grpc.ServiceError, response: ReadVersionResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  // -------------------------- manipulation ----------------------------- //
+  async rename(uid: string, newName: string): Promise<boolean> {
+    try { return (await this.call('Rename', { uid, new_name: newName, auth: this.auth() })).success; }
+    catch { return false; }
   }
 
-  // Metadata operations
-  setMetadata(uid: string, key: string, value: string, user: string, tenant: string = 'default'): Promise<SetMetadataResponse> {
-    return new Promise((resolve, reject) => {
-      const request: SetMetadataRequest = {
-        uid,
-        key,
-        value,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.SetMetadata(request, (error: grpc.ServiceError, response: SetMetadataResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async move(sourceUid: string, destinationUid: string, newName?: string): Promise<boolean> {
+    try {
+      const r = await this.call('Move', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() });
+      if (r.success && newName) return this.rename(sourceUid, newName);
+      return r.success;
+    } catch { return false; }
   }
 
-  getMetadata(uid: string, key: string, user: string, tenant: string = 'default'): Promise<GetMetadataResponse> {
-    return new Promise((resolve, reject) => {
-      const request: GetMetadataRequest = {
-        uid,
-        key,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.GetMetadata(request, (error: grpc.ServiceError, response: GetMetadataResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async copy(sourceUid: string, destinationUid: string): Promise<boolean> {
+    try { return (await this.call('Copy', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() })).success; }
+    catch { return false; }
   }
 
-  getAllMetadata(uid: string, user: string, tenant: string = 'default'): Promise<GetAllMetadataResponse> {
-    return new Promise((resolve, reject) => {
-      const request: GetAllMetadataRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.GetAllMetadata(request, (error: grpc.ServiceError, response: GetAllMetadataResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async remove(uid: string): Promise<boolean> {
+    try {
+      const info = await this.call('Stat', { uid, auth: this.auth() });
+      if (info.success && info.info.type === 'DIRECTORY') {
+        return (await this.call('RemoveDirectory', { uid, auth: this.auth() })).success;
+      }
+      return (await this.call('RemoveFile', { uid, auth: this.auth() })).success;
+    } catch { return false; }
   }
 
-  deleteMetadata(uid: string, key: string, user: string, tenant: string = 'default'): Promise<DeleteMetadataResponse> {
-    return new Promise((resolve, reject) => {
-      const request: DeleteMetadataRequest = {
-        uid,
-        key,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.DeleteMetadata(request, (error: grpc.ServiceError, response: DeleteMetadataResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async undeleteFile(uid: string): Promise<boolean> {
+    try { return (await this.call('UndeleteFile', { uid, auth: this.auth() })).success; }
+    catch { return false; }
   }
 
-  getMetadataForVersion(uid: string, version: number, key: string, user: string, tenant: string = 'default'): Promise<GetMetadataForVersionResponse> {
-    return new Promise((resolve, reject) => {
-      const request: GetMetadataForVersionRequest = {
-        uid,
-        version,
-        key,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.GetMetadataForVersion(request, (error: grpc.ServiceError, response: GetMetadataForVersionResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  // ------------------------------ versions ----------------------------- //
+  async revisions(uid: string): Promise<Revision[]> {
+    try {
+      const r = await this.call('ListVersions', { uid, auth: this.auth() });
+      if (!r.success) return [];
+      return (r.versions || []).map((ts: string): Revision => ({ version: ts, name: uid, user: this.user }));
+    } catch { return []; }
   }
 
-  getAllMetadataForVersion(uid: string, version: number, user: string, tenant: string = 'default'): Promise<GetAllMetadataForVersionResponse> {
-    return new Promise((resolve, reject) => {
-      const request: GetAllMetadataForVersionRequest = {
-        uid,
-        version,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.GetAllMetadataForVersion(request, (error: grpc.ServiceError, response: GetAllMetadataForVersionResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async restoreToVersion(uid: string, versionTimestamp: string): Promise<string | false> {
+    try {
+      const r = await this.call('RestoreToVersion', { uid, version_timestamp: versionTimestamp, auth: this.auth() });
+      return r.success ? r.restored_version : false;
+    } catch { return false; }
   }
 
-  // Path resolution
-  resolvePath(path: string, user: string, tenant: string = 'default'): Promise<ResolvePathResponse> {
-    return new Promise((resolve, reject) => {
-      const request: ResolvePathRequest = {
-        path,
-        auth: this.createAuthContext(user, [], tenant)
-      };
-
-      this.client.ResolvePath(request, (error: grpc.ServiceError, response: ResolvePathResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
-      });
-    });
+  async purgeOldVersions(uid: string, keepCount: number): Promise<boolean> {
+    try { return (await this.call('PurgeOldVersions', { uid, keep_count: keepCount, auth: this.auth() })).success; }
+    catch { return false; }
   }
 
-  // ACL operations
-  evaluateACL(uid: string, user: string, tenant: string = 'default'): Promise<EvaluateACLResponse> {
-    return new Promise((resolve, reject) => {
-      const request: EvaluateACLRequest = {
-        uid,
-        auth: this.createAuthContext(user, [], tenant)
-      };
+  // ------------------------------ metadata ----------------------------- //
+  async setMetadataValue(uid: string, key: string, value: string): Promise<boolean> {
+    try { return (await this.call('SetMetadata', { uid, key, value, auth: this.auth() })).success; }
+    catch { return false; }
+  }
 
-      this.client.EvaluateACL(request, (error: grpc.ServiceError, response: EvaluateACLResponse) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(response);
-        }
+  async getMetadataValue(uid: string, key: string): Promise<string | null> {
+    try { const r = await this.call('GetMetadata', { uid, key, auth: this.auth() }); return r.success ? r.value : null; }
+    catch { return null; }
+  }
+
+  async getMetadataValues(uid: string): Promise<{ [k: string]: string }> {
+    try { const r = await this.call('GetAllMetadata', { uid, auth: this.auth() }); return r.success ? (r.metadata || {}) : {}; }
+    catch { return {}; }
+  }
+
+  async deleteMetadataValue(uid: string, key: string): Promise<boolean> {
+    try { return (await this.call('DeleteMetadata', { uid, key, auth: this.auth() })).success; }
+    catch { return false; }
+  }
+
+  async getMetadataForVersion(uid: string, version: string, key: string): Promise<string | null> {
+    try { const r = await this.call('GetMetadataForVersion', { uid, version_timestamp: String(version), key, auth: this.auth() }); return r.success ? r.value : null; }
+    catch { return null; }
+  }
+
+  async getAllMetadataForVersion(uid: string, version: string): Promise<{ [k: string]: string }> {
+    try { const r = await this.call('GetAllMetadataForVersion', { uid, version_timestamp: String(version), auth: this.auth() }); return r.success ? (r.metadata || {}) : {}; }
+    catch { return {}; }
+  }
+
+  // --------------------------- permissions ----------------------------- //
+  async checkPermission(resourceUid: string, permission: PermissionName | string, user?: string, roles?: string[]): Promise<boolean> {
+    try {
+      const r = await this.call('CheckPermission', {
+        resource_uid: resourceUid,
+        required_permission: coercePermission(permission),
+        auth: this.auth(user, roles),
       });
-    });
+      return Boolean(r.success && r.has_permission);
+    } catch { return false; }
+  }
+
+  async grantPermission(resourceUid: string, principal: string, permission: PermissionName | string, effect: AclEffectName | string = 'ALLOW'): Promise<boolean> {
+    try {
+      return (await this.call('GrantPermission', {
+        resource_uid: resourceUid, principal,
+        permission: coercePermission(permission), effect: coerceEffect(effect),
+        auth: this.auth(),
+      })).success;
+    } catch { return false; }
+  }
+
+  async revokePermission(resourceUid: string, principal: string, permission: PermissionName | string, effect: AclEffectName | string = 'ALLOW'): Promise<boolean> {
+    try {
+      return (await this.call('RevokePermission', {
+        resource_uid: resourceUid, principal,
+        permission: coercePermission(permission), effect: coerceEffect(effect),
+        auth: this.auth(),
+      })).success;
+    } catch { return false; }
+  }
+
+  // ------------------------------- roles ------------------------------- //
+  async createRole(role: string): Promise<boolean> {
+    try { return (await this.call('CreateRole', { role, auth: this.auth() })).success; } catch { return false; }
+  }
+
+  async deleteRole(role: string): Promise<boolean> {
+    try { return (await this.call('DeleteRole', { role, auth: this.auth() })).success; } catch { return false; }
+  }
+
+  async assignUserToRole(targetUser: string, role: string): Promise<boolean> {
+    try { return (await this.call('AssignUserToRole', { user: targetUser, role, auth: this.auth() })).success; } catch { return false; }
+  }
+
+  async removeUserFromRole(targetUser: string, role: string): Promise<boolean> {
+    try { return (await this.call('RemoveUserFromRole', { user: targetUser, role, auth: this.auth() })).success; } catch { return false; }
+  }
+
+  async getRolesForUser(targetUser: string): Promise<string[]> {
+    try { const r = await this.call('GetRolesForUser', { user: targetUser, auth: this.auth() }); return r.success ? (r.roles || []) : []; } catch { return []; }
+  }
+
+  async getUsersForRole(role: string): Promise<string[]> {
+    try { const r = await this.call('GetUsersForRole', { role, auth: this.auth() }); return r.success ? (r.users || []) : []; } catch { return []; }
+  }
+
+  async getAllRoles(): Promise<string[]> {
+    try { const r = await this.call('GetAllRoles', { auth: this.auth() }); return r.success ? (r.roles || []) : []; } catch { return []; }
+  }
+
+  // --------------------------- administrative -------------------------- //
+  async getStorageUsage(): Promise<StorageUsage | null> {
+    try {
+      const r = await this.call('GetStorageUsage', { auth: this.auth(), tenant: this.tenant });
+      if (!r.success) return null;
+      return {
+        totalSpace: Number(r.total_space) || 0,
+        usedSpace: Number(r.used_space) || 0,
+        availableSpace: Number(r.available_space) || 0,
+        usagePercentage: Number(r.usage_percentage) || 0,
+      };
+    } catch { return null; }
+  }
+
+  async triggerSync(): Promise<boolean> {
+    try { return (await this.call('TriggerSync', { tenant: this.tenant, auth: this.auth() })).success; }
+    catch { return false; }
   }
 }
 
 export default FileEngineClient;
-export { ProtoFileType };
