@@ -5,7 +5,7 @@
   "main": "dist/fileengine_grpc_client.js",
   "types": "dist/fileengine_grpc_client.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run build && node test_client.js",
     "build": "tsc",
     "dev": "tsc --watch"
   },

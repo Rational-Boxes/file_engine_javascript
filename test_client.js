@@ -1,352 +1,160 @@
-const FileEngineClient = require('./fileengine_grpc_client');
+/**
+ * Full integration test for the FileEngine JS/TS client against a RUNNING
+ * server (default localhost:50051). Mirrors the Python test_integration_full
+ * suite so the two libraries stay equivalent.
+ *
+ * Administration is role-based: the client authenticates with the
+ * `system_admin` role (the username itself is not special).
+ *
+ * Run:  node test_client.js  [server_address]
+ */
+const { FileEngineClient, ZERO_UID } = require('./dist/fileengine_grpc_client');
 
-// Test constants
-const SERVER_ADDRESS = 'localhost:50051';
-const TEST_USER = 'root';
-const TEST_TENANT = 'default';
-
-// Global variables to hold test UIDs
-let testRootDirUid = '';
-let testFileUid = '';
-let testSubDirUid = '';
-
-// Initialize the client
-const client = new FileEngineClient(SERVER_ADDRESS);
-
-console.log('Starting FileEngine gRPC client tests (fileengine protocol)...\n');
-
-// Test helper function
-function runTest(description, testFn) {
-  return testFn()
-    .then(() => {
-      console.log(`✅ ${description}`);
-      return true;
-    })
-    .catch((error) => {
-      console.log(`❌ ${description}: ${error.message}`);
-      return false;
-    });
+const SERVER = process.argv[2] || 'localhost:50051';
+let pass = 0, fail = 0;
+const failures = [];
+function ok(cond, msg) {
+  if (cond) { pass++; console.log('  \x1b[32m✓\x1b[0m ' + msg); }
+  else { fail++; failures.push(msg); console.log('  \x1b[31m✗\x1b[0m ' + msg); }
 }
 
-// A directory entry's type is carried as the ProtoFileType enum name
-// (proto-loader is configured with enums: String).
-function isDirectoryType(type) {
-  return type === 'PROTO_DIRECTORY' || type === 1;
+async function main() {
+  const admin = new FileEngineClient({
+    serverAddress: SERVER, userName: 'admin_user',
+    userRoles: ['system_admin'], tenant: 'default',
+  });
+
+  const suf = `${Date.now()}`;
+  console.log(`FileEngine JS client integration test  server=${SERVER}`);
+
+  // [0] connectivity + root aliasing
+  console.log('[0] Connectivity / root aliasing');
+  const su = await admin.getStorageUsage();
+  ok(su && su.totalSpace > 0, 'storage usage (typed)');
+  const rootA = await admin.dir('');
+  const rootB = await admin.dir(ZERO_UID);
+  ok(Array.isArray(rootA) && Array.isArray(rootB) && rootA.length === rootB.length, 'root aliases list identically');
+
+  const ws = await admin.mkdir('', `jsit_${suf}`);
+  ok(Boolean(ws), `mkdir workspace (system_admin) -> ${ws}`);
+  const zdir = await admin.mkdir(ZERO_UID, `jsit_zero_${suf}`);
+  ok(Boolean(zdir), 'mkdir via all-zeros root');
+  ok((await admin.dir('')).some(e => e.name === `jsit_zero_${suf}`), 'zero-root dir visible at root');
+
+  // [1] filesystem
+  console.log('[1] Filesystem');
+  const f = await admin.touch(ws, 'hello.txt');
+  ok(Boolean(f), `touch -> ${f}`);
+  ok((await admin.put(f, 'hello v1')) !== false, 'put v1');
+  ok((await admin.put(f, Buffer.from('hello v2'))) !== false, 'put v2');
+  const got = await admin.get(f);
+  ok(got && got.toString() === 'hello v2', 'get latest == v2');
+  ok(await admin.exists(f), 'exists file');
+  ok(!(await admin.exists('deadbeef-0000-0000-0000-000000000000')), 'exists false for bogus uid');
+  ok((await admin.stat(ws)).isDir === true, 'stat dir isDir true');
+  ok((await admin.stat(f)).isDir === false, 'stat file isDir false');
+  ok((await admin.getParent(f)) === ws, 'getParent == workspace');
+  ok(await admin.rename(f, 'renamed.txt'), 'rename');
+  ok((await admin.stat(f)).name === 'renamed.txt', 'stat shows renamed');
+
+  const sub = await admin.mkdir(ws, 'sub');
+  const sub2 = await admin.mkdir(ws, 'sub2');
+  ok(await admin.copy(f, sub), 'copy file to sub');
+  ok((await admin.dir(sub)).some(e => e.name === 'renamed.txt'), 'copied file in sub');
+  ok(await admin.move(f, sub2), 'move file to sub2');
+  ok((await admin.getParent(f)) === sub2, 'moved file parent == sub2');
+
+  // subtree guard
+  const guard = await admin.mkdir(ws, 'guard');
+  const gchild = await admin.mkdir(guard, 'child');
+  ok((await admin.copy(guard, gchild)) === false, 'copy dir into own subtree rejected');
+  ok((await admin.move(guard, gchild)) === false, 'move dir into own subtree rejected');
+  ok((await admin.getStorageUsage()) !== null, 'server alive after guard');
+
+  // recursive dir copy
+  const rcsrc = await admin.mkdir(ws, 'rcsrc');
+  const inner = await admin.touch(rcsrc, 'inner.txt');
+  await admin.put(inner, 'inner');
+  const rcdst = await admin.mkdir(ws, 'rcdst');
+  ok(await admin.copy(rcsrc, rcdst), 'recursive dir copy');
+  const copiedDir = (await admin.dir(rcdst)).find(e => e.name === 'rcsrc');
+  ok(copiedDir && (await admin.dir(copiedDir.uid)).some(e => e.name === 'inner.txt'), 'recursive copy preserved contents');
+
+  // soft delete / lsd / undelete
+  const delbox = await admin.mkdir(ws, 'delbox');
+  const gone = await admin.touch(delbox, 'gone.txt');
+  await admin.put(gone, 'bye');
+  ok(await admin.remove(gone), 'soft delete file');
+  ok(!(await admin.dir(delbox)).some(e => e.name === 'gone.txt'), 'ls hides deleted');
+  ok((await admin.listDeleted(delbox)).some(e => e.name === 'gone.txt'), 'lsd shows deleted');
+  ok(await admin.undeleteFile(gone), 'undelete');
+  ok((await admin.dir(delbox)).some(e => e.name === 'gone.txt'), 'ls shows undeleted');
+
+  // [2] versioning
+  console.log('[2] Versioning');
+  const vf = await admin.touch(ws, 'ver.txt');
+  await admin.put(vf, 'v1');
+  await new Promise(r => setTimeout(r, 1100)); await admin.put(vf, 'v2');
+  await new Promise(r => setTimeout(r, 1100)); await admin.put(vf, 'v3');
+  const revs = await admin.revisions(vf);
+  ok(revs.length >= 3, `revisions (${revs.length})`);
+  ok((await admin.get(vf, 1)).toString() === 'v2', 'get one back == v2');
+  ok((await admin.restoreToVersion(vf, revs[1].version)) !== false, 'restore to version');
+  ok(await admin.purgeOldVersions(vf, 1), 'purge keep 1');
+  ok((await admin.revisions(vf)).length <= 1, 'purge trimmed versions');
+
+  // [3] metadata
+  console.log('[3] Metadata');
+  const mf = await admin.touch(ws, 'meta.txt'); await admin.put(mf, 'm');
+  ok(await admin.setMetadataValue(mf, 'color', 'blue'), 'setMetadata');
+  ok((await admin.getMetadataValue(mf, 'color')) === 'blue', 'getMetadata == blue');
+  ok((await admin.getMetadataValues(mf)).color === 'blue', 'getAllMetadata');
+  ok((await admin.getAllMetadataForVersion(mf, 'current')).color === 'blue', 'allMetadataForVersion current');
+  ok((await admin.getMetadataForVersion(mf, 'current', 'color')) === 'blue', 'metadataForVersion current');
+  ok(await admin.deleteMetadataValue(mf, 'color'), 'deleteMetadata');
+  ok((await admin.getMetadataValue(mf, 'color')) === null, 'metadata removed');
+
+  // [4] permissions / ACL
+  console.log('[4] Permissions / ACL');
+  const af = await admin.touch(ws, 'acl.txt'); await admin.put(af, 'a');
+  for (const letter of ['r', 'w', 'x', 'd', 'm']) {
+    ok(await admin.grantPermission(af, 'dave', letter), `grant ${letter} to dave`);
+    ok(await admin.checkPermission(af, letter, 'dave', []), `dave has ${letter}`);
+  }
+  await admin.grantPermission(af, 'erin', 'r');
+  await admin.grantPermission(af, 'erin', 'r', 'deny');
+  ok((await admin.checkPermission(af, 'r', 'erin', [])) === false, 'DENY overrides ALLOW');
+  await admin.revokePermission(af, 'erin', 'r', 'deny');
+  ok((await admin.checkPermission(af, 'r', 'erin', [])) === true, 'access restored after deny-revoke');
+
+  // [5] roles
+  console.log('[5] Role management');
+  const role = `editors_${suf}`;
+  ok(await admin.createRole(role), 'createRole');
+  ok((await admin.getAllRoles()).includes(role), 'getAllRoles shows role');
+  ok(await admin.assignUserToRole('carol', role), 'assignUserToRole');
+  ok((await admin.getRolesForUser('carol')).includes(role), 'getRolesForUser');
+  ok((await admin.getUsersForRole(role)).includes('carol'), 'getUsersForRole');
+  ok(await admin.grantPermission(af, `role:${role}`, 'r'), 'grant READ to role');
+  ok(await admin.checkPermission(af, 'r', 'carol', [role]), 'carol(role) has READ');
+  ok(await admin.removeUserFromRole('carol', role), 'removeUserFromRole');
+  ok(!(await admin.getRolesForUser('carol')).includes(role), 'remove took effect');
+  ok(await admin.deleteRole(role), 'deleteRole');
+
+  // [6] diagnostics
+  console.log('[6] Diagnostics');
+  ok(await admin.triggerSync(), 'triggerSync');
+
+  // cleanup
+  await admin.remove(ws);
+  await admin.remove(zdir);
+  admin.close();
+
+  console.log('==========================================================');
+  console.log(` RESULTS:  PASS=${pass}  FAIL=${fail}`);
+  if (fail) { console.log(' Failed:'); failures.forEach(m => console.log('   - ' + m)); }
+  console.log('==========================================================');
+  process.exit(fail === 0 ? 0 : 1);
 }
 
-// Main test function
-async function runAllTests() {
-  let passedTests = 0;
-  const totalTests = 25; // Update this number when adding/removing tests
-
-  // Test 1: MakeDirectory
-  const test1Result = await runTest('MakeDirectory - Create root test directory', async () => {
-    const response = await client.makeDirectory('', 'test_root_dir', TEST_USER, TEST_TENANT);
-    if (!response.success || !response.uid) {
-      throw new Error('Failed to create directory or missing UID');
-    }
-    testRootDirUid = response.uid;
-    console.log(`   - Created directory with UID: ${testRootDirUid}`);
-  });
-  if (test1Result) passedTests++;
-
-  // Test 2: GetFileInfo on created directory
-  const test2Result = await runTest('GetFileInfo - Get directory information', async () => {
-    const response = await client.getFileInfo(testRootDirUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !response.info) {
-      throw new Error('Failed to get directory info');
-    }
-    if (response.info.uid !== testRootDirUid) {
-      throw new Error('Returned UID does not match expected');
-    }
-    console.log(`   - Directory name: ${response.info.name}, Size: ${response.info.size} bytes`);
-  });
-  if (test2Result) passedTests++;
-
-  // Test 3: FileExists - Check if directory exists
-  const test3Result = await runTest('FileExists - Check if directory exists', async () => {
-    const response = await client.fileExists(testRootDirUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !response.exists) {
-      throw new Error('Directory should exist but was not found');
-    }
-  });
-  if (test3Result) passedTests++;
-
-  // Test 4: CreateFile - Create a file in the directory
-  const test4Result = await runTest('CreateFile - Create a test file', async () => {
-    const response = await client.createFile(testRootDirUid, 'test_file.txt', TEST_USER, TEST_TENANT);
-    if (!response.success || !response.uid) {
-      throw new Error('Failed to create file or missing UID');
-    }
-    testFileUid = response.uid;
-    console.log(`   - Created file with UID: ${testFileUid}`);
-  });
-  if (test4Result) passedTests++;
-
-  // Test 5: WriteFile - Write content to the file
-  const test5Result = await runTest('WriteFile - Write content to file', async () => {
-    const testData = 'Hello, FileEngine!';
-    const response = await client.writeFile(testFileUid, testData, TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to write file content');
-    }
-  });
-  if (test5Result) passedTests++;
-
-  // Test 6: ReadFile - Read content from the file
-  const test6Result = await runTest('ReadFile - Read content from file', async () => {
-    const response = await client.readFile(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !response.data) {
-      throw new Error('Failed to read file content');
-    }
-    const content = response.data.toString();
-    if (content !== 'Hello, FileEngine!') {
-      throw new Error(`Read content does not match. Expected: 'Hello, FileEngine!', Got: '${content}'`);
-    }
-    console.log(`   - File content: ${content}`);
-  });
-  if (test6Result) passedTests++;
-
-  // Test 7: ListDirectory - List contents of root directory
-  const test7Result = await runTest('ListDirectory - List contents of test directory', async () => {
-    const response = await client.listDirectory(testRootDirUid, TEST_USER, false, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.entries)) {
-      throw new Error('Failed to list directory contents');
-    }
-    if (response.entries.length !== 1 || response.entries[0].uid !== testFileUid) {
-      throw new Error('Directory listing does not match expected content');
-    }
-    console.log(`   - Directory contains ${response.entries.length} item(s)`);
-  });
-  if (test7Result) passedTests++;
-
-  // Test 8: MakeDirectory - Create a subdirectory
-  const test8Result = await runTest('MakeDirectory - Create subdirectory', async () => {
-    const response = await client.makeDirectory(testRootDirUid, 'test_subdir', TEST_USER, TEST_TENANT);
-    if (!response.success || !response.uid) {
-      throw new Error('Failed to create subdirectory or missing UID');
-    }
-    testSubDirUid = response.uid;
-    console.log(`   - Created subdirectory with UID: ${testSubDirUid}`);
-  });
-  if (test8Result) passedTests++;
-
-  // Test 9: RenameFile - Rename the file
-  const test9Result = await runTest('RenameFile - Rename the test file', async () => {
-    const response = await client.renameFile(testFileUid, 'renamed_test_file.txt', TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to rename file');
-    }
-    console.log(`   - Successfully renamed file`);
-  });
-  if (test9Result) passedTests++;
-
-  // Test 10: GetFileInfo - Get info for renamed file
-  const test10Result = await runTest('GetFileInfo - Get info for renamed file', async () => {
-    const response = await client.getFileInfo(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !response.info) {
-      throw new Error('Failed to get renamed file info');
-    }
-    if (response.info.name !== 'renamed_test_file.txt') {
-      throw new Error(`File name was not updated. Expected: 'renamed_test_file.txt', Got: '${response.info.name}'`);
-    }
-    console.log(`   - File name after rename: ${response.info.name}`);
-  });
-  if (test10Result) passedTests++;
-
-  // Test 11: MoveFile - Move the file to subdirectory
-  const test11Result = await runTest('MoveFile - Move file to subdirectory', async () => {
-    const response = await client.moveFile(testFileUid, testSubDirUid, TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to move file');
-    }
-    console.log(`   - Successfully moved file to subdirectory`);
-  });
-  if (test11Result) passedTests++;
-
-  // Test 12: ListDirectory - List contents of subdirectory to verify move
-  const test12Result = await runTest('ListDirectory - Verify file moved to subdirectory', async () => {
-    const response = await client.listDirectory(testSubDirUid, TEST_USER, false, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.entries) || response.entries.length !== 1) {
-      throw new Error('Failed to list subdirectory contents or unexpected number of entries');
-    }
-    if (response.entries[0].uid !== testFileUid) {
-      throw new Error('File was not found in subdirectory after move');
-    }
-    console.log(`   - Subdirectory contains ${response.entries.length} item(s)`);
-  });
-  if (test12Result) passedTests++;
-
-  // Test 13: ListDirectory - List contents of root to verify file removed
-  const test13Result = await runTest('ListDirectory - Verify file removed from root directory', async () => {
-    const response = await client.listDirectory(testRootDirUid, TEST_USER, false, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.entries) || response.entries.length !== 1) {
-      throw new Error('Root directory should have only the subdirectory after move');
-    }
-    if (response.entries[0].uid !== testSubDirUid || !isDirectoryType(response.entries[0].type)) {
-      throw new Error('Root directory does not contain expected subdirectory');
-    }
-    console.log(`   - Root directory now contains ${response.entries.length} item(s)`);
-  });
-  if (test13Result) passedTests++;
-
-  // Test 14: CopyFile - Copy the file back to root directory
-  const test14Result = await runTest('CopyFile - Copy file back to root directory', async () => {
-    const response = await client.copyFile(testFileUid, testRootDirUid, TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to copy file');
-    }
-    console.log(`   - Successfully copied file back to root directory`);
-  });
-  if (test14Result) passedTests++;
-
-  // Test 15: ListDirectory - List contents of root to verify copy
-  const test15Result = await runTest('ListDirectory - Verify file copied to root directory', async () => {
-    const response = await client.listDirectory(testRootDirUid, TEST_USER, false, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.entries) || response.entries.length !== 2) {
-      throw new Error('Root directory should have 2 items after copy (subdir + copied file)');
-    }
-    console.log(`   - Root directory now contains ${response.entries.length} item(s) after copy`);
-  });
-  if (test15Result) passedTests++;
-
-  // Test 16: SetMetadata - Set metadata on the file
-  const test16Result = await runTest('SetMetadata - Set metadata on file', async () => {
-    const response = await client.setMetadata(testFileUid, 'author', 'test_user', TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to set metadata');
-    }
-    console.log(`   - Successfully set metadata on file`);
-  });
-  if (test16Result) passedTests++;
-
-  // Test 17: GetMetadata - Get specific metadata
-  const test17Result = await runTest('GetMetadata - Get specific metadata', async () => {
-    const response = await client.getMetadata(testFileUid, 'author', TEST_USER, TEST_TENANT);
-    if (!response.success || response.value !== 'test_user') {
-      throw new Error(`Failed to get metadata or incorrect value. Expected: 'test_user', Got: '${response.value}'`);
-    }
-    console.log(`   - Retrieved metadata: author = ${response.value}`);
-  });
-  if (test17Result) passedTests++;
-
-  // Test 18: GetAllMetadata - Get all metadata (repeated MetadataEntry array)
-  const test18Result = await runTest('GetAllMetadata - Get all metadata', async () => {
-    const response = await client.getAllMetadata(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.metadata)) {
-      throw new Error('Failed to get all metadata or metadata is not an array');
-    }
-    const authorEntry = response.metadata.find((e) => e.key === 'author');
-    if (!authorEntry || authorEntry.value !== 'test_user') {
-      throw new Error('Missing expected metadata entry author=test_user');
-    }
-    console.log(`   - All metadata:`, response.metadata);
-  });
-  if (test18Result) passedTests++;
-
-  // Test 19: DeleteMetadata - Delete specific metadata
-  const test19Result = await runTest('DeleteMetadata - Delete specific metadata', async () => {
-    const response = await client.deleteMetadata(testFileUid, 'author', TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to delete metadata');
-    }
-    console.log(`   - Successfully deleted metadata from file`);
-  });
-  if (test19Result) passedTests++;
-
-  // Test 20: GetMetadata - Verify metadata deletion
-  const test20Result = await runTest('GetMetadata - Verify metadata deletion', async () => {
-    try {
-      const response = await client.getMetadata(testFileUid, 'author', TEST_USER, TEST_TENANT);
-      // If we get here without error, the metadata should report not-found
-      if (response.success && response.value) {
-        throw new Error('Metadata should have been deleted but still exists');
-      }
-      console.log(`   - Confirmed metadata was deleted`);
-    } catch (error) {
-      // This is also acceptable if the server signals deletion via an error
-      if (error.message.includes('not found')) {
-        console.log(`   - Confirmed metadata was deleted`);
-      } else {
-        throw error;
-      }
-    }
-  });
-  if (test20Result) passedTests++;
-
-  // Test 21: ListVersions - List file versions
-  const test21Result = await runTest('ListVersions - List versions of the file', async () => {
-    const response = await client.listVersions(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.versions)) {
-      throw new Error(`Failed to list versions: ${response.error || 'Unknown error'}`);
-    }
-    console.log(`   - File has ${response.versions.length} version(s)`);
-  });
-  if (test21Result) passedTests++;
-
-  // Test 22: ResolvePath - Resolve a path to a UID
-  const test22Result = await runTest('ResolvePath - Resolve root test directory path', async () => {
-    const response = await client.resolvePath('/test_root_dir', TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error(`Failed to resolve path: ${response.error || 'Unknown error'}`);
-    }
-    console.log(`   - Resolved '/test_root_dir' to UID: ${response.uid} (type: ${response.type})`);
-  });
-  if (test22Result) passedTests++;
-
-  // Test 23: EvaluateACL - Evaluate effective permissions on a resource
-  const test23Result = await runTest('EvaluateACL - Evaluate permissions on file', async () => {
-    const response = await client.evaluateACL(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success || !Array.isArray(response.permissions)) {
-      throw new Error(`Failed to evaluate ACL: ${response.error || 'Unknown error'}`);
-    }
-    console.log(`   - Effective permissions: ${response.permissions.join(', ') || '(none)'}`);
-  });
-  if (test23Result) passedTests++;
-
-  // Test 24: ListDirectory with deleted - include soft-deleted entries
-  const test24Result = await runTest('ListDirectory - List directory including deleted items', async () => {
-    const response = await client.listDirectory(testRootDirUid, TEST_USER, true, TEST_TENANT);
-    if (!response.success) {
-      throw new Error(`Failed to list directory with deleted items: ${response.error || 'Unknown error'}`);
-    }
-    console.log(`   - Listed directory with deleted items (count: ${response.entries.length})`);
-  });
-  if (test24Result) passedTests++;
-
-  // Test 25: DeleteFile - Clean up by deleting the file
-  const test25Result = await runTest('DeleteFile - Clean up test file', async () => {
-    const response = await client.deleteFile(testFileUid, TEST_USER, TEST_TENANT);
-    if (!response.success) {
-      throw new Error('Failed to delete test file');
-    }
-    console.log(`   - Successfully deleted test file`);
-  });
-  if (test25Result) passedTests++;
-
-  // Clean up remaining test directories
-  try {
-    await client.removeDirectory(testSubDirUid, TEST_USER, TEST_TENANT);
-    console.log(`   - Cleaned up subdirectory`);
-  } catch (error) {
-    console.log(`   - Warning: Failed to clean up subdirectory: ${error.message}`);
-  }
-
-  try {
-    await client.removeDirectory(testRootDirUid, TEST_USER, TEST_TENANT);
-    console.log(`   - Cleaned up root test directory`);
-  } catch (error) {
-    console.log(`   - Warning: Failed to clean up root directory: ${error.message}`);
-  }
-
-  console.log(`\nTests completed: ${passedTests}/${totalTests} passed`);
-
-  if (passedTests === totalTests) {
-    console.log('\n🎉 All tests passed!');
-  } else {
-    console.log(`\n⚠️  ${totalTests - passedTests} test(s) failed.`);
-  }
-}
-
-// Run the tests
-runAllTests().catch(console.error);
+main().catch(e => { console.error('FATAL', e); process.exit(2); });
