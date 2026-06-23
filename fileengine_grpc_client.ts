@@ -409,12 +409,14 @@ export class FileEngineClient {
   }
 
   // --------------------------- permissions ----------------------------- //
-  async checkPermission(resourceUid: string, permission: PermissionName | string, user?: string, roles?: string[]): Promise<boolean> {
+  // `claims` lets CLAIM-type (ABAC) rules match — pass the requester's auth
+  // claims (key->value). Omit for plain user/role checks.
+  async checkPermission(resourceUid: string, permission: PermissionName | string, user?: string, roles?: string[], claims?: { [k: string]: string }): Promise<boolean> {
     try {
       const r = await this.call('CheckPermission', {
         resource_uid: resourceUid,
         required_permission: coercePermission(permission),
-        auth: this.auth(user, roles),
+        auth: this.auth(user, roles, undefined, claims),
       });
       return Boolean(r.success && r.has_permission);
     } catch { return false; }
@@ -424,8 +426,8 @@ export class FileEngineClient {
    * Resolve a principal's full effective permission set on a resource in one
    * call, without accessing the entity. Returns permission names (e.g.
    * ['READ','WRITE']). Intended for systems that must respect filesystem
-   * permissions (e.g. a search indexer). Claims are forwarded on the auth
-   * context (the engine is currently RBAC, so they don't yet alter the result).
+   * permissions (e.g. a search indexer). `claims` are forwarded on the auth
+   * context and feed CLAIM-type (ABAC) rule matching.
    */
   async getEffectivePermissions(
     resourceUid: string,

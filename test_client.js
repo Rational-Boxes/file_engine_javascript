@@ -136,6 +136,20 @@ async function main() {
   const effNobody = await admin.getEffectivePermissions(af, 'nobody', []);
   ok(!effNobody.includes('WRITE'), 'effective set empty-ish for principal with no grants');
 
+  // claim-based (ABAC) rules: grant to "claim:key=value", decision follows the
+  // requester's auth claims rather than user/roles.
+  const cf = await admin.touch(ws, 'claim.txt'); await admin.put(cf, 'c');
+  await admin.grantPermission(cf, 'claim:department=engineering', 'r');
+  await admin.grantPermission(cf, 'claim:department=engineering', 'w');
+  const eng = { department: 'engineering' };
+  ok(await admin.checkPermission(cf, 'r', 'ivy', [], eng), 'matching claim grants READ');
+  const effEng = await admin.getEffectivePermissions(cf, 'ivy', [], eng);
+  ok(effEng.includes('READ') && effEng.includes('WRITE'), 'claim effective set includes granted perms');
+  ok((await admin.checkPermission(cf, 'r', 'ivy', [], { department: 'sales' })) === false, 'non-matching claim value denied');
+  ok((await admin.checkPermission(cf, 'r', 'ivy', [], {})) === false, 'absent claim denied');
+  await admin.grantPermission(cf, 'claim:status=quarantined', 'r', 'deny');
+  ok((await admin.checkPermission(cf, 'r', 'ivy', [], { department: 'engineering', status: 'quarantined' })) === false, 'matching DENY claim overrides ALLOW');
+
   // [5] roles
   console.log('[5] Role management');
   const role = `editors_${suf}`;
