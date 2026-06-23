@@ -127,6 +127,15 @@ async function main() {
   await admin.revokePermission(af, 'erin', 'r', 'deny');
   ok((await admin.checkPermission(af, 'r', 'erin', [])) === true, 'access restored after deny-revoke');
 
+  // effective permission set (one call; for indexer-style consumers)
+  await admin.grantPermission(af, 'frank', 'r');
+  await admin.grantPermission(af, 'frank', 'w');
+  const effFrank = await admin.getEffectivePermissions(af, 'frank', []);
+  ok(effFrank.includes('READ') && effFrank.includes('WRITE'), 'effective set includes granted perms');
+  ok(!effFrank.includes('DELETE'), 'effective set excludes ungranted perms');
+  const effNobody = await admin.getEffectivePermissions(af, 'nobody', []);
+  ok(!effNobody.includes('WRITE'), 'effective set empty-ish for principal with no grants');
+
   // [5] roles
   console.log('[5] Role management');
   const role = `editors_${suf}`;
