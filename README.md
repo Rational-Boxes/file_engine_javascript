@@ -156,11 +156,23 @@ index).
 
 ### ACL Operations
 
-#### evaluateACL(uid, user, tenant = 'default')
-Evaluates the effective permissions for the principal on a resource. Returns
-`{ success, permissions }`, where `permissions` is an array of permission
-strings. The `fileengine` protocol exposes ACL evaluation only; ACL mutation
-(grant/revoke) is handled outside this service.
+#### grantPermission(resourceUid, principal, permission, effect = 'ALLOW')
+Grants (or, with `effect='DENY'`, denies) a permission to a principal. The
+`principal` selects the rule kind by prefix:
+- a bare name targets a **user**;
+- `role:<name>` targets a **role**;
+- `claim:<key>=<value>` targets an **attribute-based (ABAC) claim** — the rule
+  matches any requester whose auth claims contain that key/value pair.
+
+#### checkPermission(resourceUid, permission, user?, roles?, claims?)
+Returns a boolean decision. Pass `claims` (a `{ [key]: value }` map) so that
+`claim:`-based rules can match the requester.
+
+#### getEffectivePermissions(resourceUid, user?, roles?, claims?)
+Resolves the principal's full effective permission set on a resource in one
+call, without accessing the entity. Returns an array of permission strings.
+`claims` feed `claim:`-based (ABAC) rule matching, so an external indexer gets
+the same decision the filesystem would enforce.
 
 ## Examples
 
