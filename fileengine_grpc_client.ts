@@ -44,6 +44,10 @@ export interface FileInfo {
   modifiedAt: Date | null;
   version: string;
   isDir: boolean;
+  /** Hidden child renditions (alternate formats); files only, 0 for dirs. */
+  renditionCount: number;
+  /** True if this file has hidden renditions. */
+  hasRenditions: boolean;
 }
 
 export interface DirectoryEntry {
@@ -55,6 +59,10 @@ export interface DirectoryEntry {
   modifiedAt: Date | null;
   versionCount: number;
   isContainer: boolean;
+  /** Hidden child renditions (alternate formats); files only, 0 for dirs. */
+  renditionCount: number;
+  /** True if this file entry has hidden renditions. */
+  hasRenditions: boolean;
 }
 
 export interface Revision {
@@ -211,12 +219,23 @@ export class FileEngineClient {
         modifiedAt: safeDate(e.modified_at),
         versionCount: Number(e.version_count) || 0,
         isContainer: e.type === 'DIRECTORY',
+        renditionCount: Number(e.rendition_count) || 0,
+        hasRenditions: (Number(e.rendition_count) || 0) > 0,
       }));
     } catch { return false; }
   }
 
   listDeleted(uid: string): Promise<DirectoryEntry[] | false> {
     return this.dir(uid, true);
+  }
+
+  /**
+   * List a file's hidden renditions (alternate-format children). Renditions are
+   * hidden from normal directory listings; pass the file's UID to reveal them.
+   * Equivalent to listing the file's UID directly.
+   */
+  renditions(uid: string): Promise<DirectoryEntry[] | false> {
+    return this.dir(uid, false);
   }
 
   // ------------------------------ file ops ----------------------------- //
@@ -272,6 +291,8 @@ export class FileEngineClient {
         modifiedAt: safeDate(i.modified_at),
         version: i.version || '',
         isDir: i.type === 'DIRECTORY',
+        renditionCount: Number(i.rendition_count) || 0,
+        hasRenditions: (Number(i.rendition_count) || 0) > 0,
       };
     } catch { return null; }
   }
