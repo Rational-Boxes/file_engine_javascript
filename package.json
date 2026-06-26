@@ -1,6 +1,6 @@
 {
   "name": "fileengine-grpc-client",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "JavaScript and TypeScript gRPC client for FileEngine virtual filesystem",
   "main": "dist/fileengine_grpc_client.js",
   "types": "dist/fileengine_grpc_client.d.ts",
