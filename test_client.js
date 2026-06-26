@@ -145,8 +145,10 @@ async function main() {
   ok(await admin.checkPermission(cf, 'r', 'ivy', [], eng), 'matching claim grants READ');
   const effEng = await admin.getEffectivePermissions(cf, 'ivy', [], eng);
   ok(effEng.includes('READ') && effEng.includes('WRITE'), 'claim effective set includes granted perms');
-  ok((await admin.checkPermission(cf, 'r', 'ivy', [], { department: 'sales' })) === false, 'non-matching claim value denied');
-  ok((await admin.checkPermission(cf, 'r', 'ivy', [], {})) === false, 'absent claim denied');
+  // READ is granted to everyone by the read-by-default baseline, so the claim's
+  // effect is witnessed by WRITE rather than READ for the negative cases.
+  ok((await admin.checkPermission(cf, 'w', 'ivy', [], { department: 'sales' })) === false, 'non-matching claim value denied (no WRITE)');
+  ok((await admin.checkPermission(cf, 'w', 'ivy', [], {})) === false, 'absent claim denied (no WRITE)');
   await admin.grantPermission(cf, 'claim:status=quarantined', 'r', 'deny');
   ok((await admin.checkPermission(cf, 'r', 'ivy', [], { department: 'engineering', status: 'quarantined' })) === false, 'matching DENY claim overrides ALLOW');
 
