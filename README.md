@@ -1,5 +1,7 @@
 # FileEngine gRPC Client
 
+> ⚠️ **Active development — not production-ready.** This project is under active development and should **not** be considered safe for mission-critical use.
+
 A JavaScript and TypeScript client for the FileEngine virtual filesystem gRPC service.
 
 ## Installation
