@@ -16,8 +16,8 @@
     "typescript",
     "javascript"
   ],
-  "author": "FileEngine Team",
-  "license": "MIT",
+  "author": "James Hickman <james@rationalboxes.com>",
+  "license": "LGPL-3.0-or-later",
   "dependencies": {
     "@grpc/grpc-js": "^1.8.14",
     "@grpc/proto-loader": "^0.7.7"

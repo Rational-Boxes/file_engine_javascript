@@ -243,4 +243,8 @@ To test the client, make sure the FileEngine gRPC server is running at `localhos
 
 ## License
 
-MIT
+Copyright (C) 2026 James Hickman <james@rationalboxes.com>
+
+This library is licensed under the **GNU Lesser General Public License, version 3
+(or later)** — see the [LICENSE](LICENSE) file. The LGPL builds on the GPL, included
+as [LICENSE.GPL-3.0](LICENSE.GPL-3.0).
