@@ -8,14 +8,35 @@
  * Administration is role-based: pass the `system_admin` role to authorize
  * root-level creation and ACL/role management. The filesystem root may be
  * referenced as the empty string `""` or the all-zeros UUID.
+ *
+ * On failure, methods THROW a typed {@link FileEngineError} subclass (see
+ * `errors.ts`) carrying the operation, target uid, and server message — rather
+ * than returning a falsy value. In particular, write operations throw
+ * {@link WriteUnavailableError} while the server is temporarily read-only during
+ * a primary-database failover; that error's `transient` flag is `true`, so the
+ * caller may retry once the primary recovers.
  */
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
 import * as fs from 'fs';
+import { raiseRpc, checkResponse, NotFoundError } from './errors';
 
 export const ROOT_UID = '';
 export const ZERO_UID = '00000000-0000-0000-0000-000000000000';
+
+export {
+  FileEngineError,
+  ServerUnreachableError,
+  ServiceUnavailableError,
+  WriteUnavailableError,
+  AuthenticationError,
+  PermissionDeniedError,
+  NotFoundError,
+  AlreadyExistsError,
+  InvalidRequestError,
+  OperationError,
+} from './errors';
 
 // ----------------------------- typed models ------------------------------ //
 export type FileTypeName = 'REGULAR_FILE' | 'DIRECTORY' | 'SYMLINK';
@@ -141,7 +162,7 @@ const proto: any = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
  * High-level FileEngine client, equivalent to the Python `ManagedFiles`.
  * Stores a default user/roles/tenant/claims used for every call (overridable
  * per call). Methods resolve to friendly values (uid string, Buffer, typed
- * models) or `false`/`null`/`[]` on error.
+ * models) and THROW a {@link FileEngineError} subclass on failure.
  */
 export class FileEngineClient {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -197,35 +218,38 @@ export class FileEngineClient {
   }
 
   // --------------------------- directory ops --------------------------- //
-  async mkdir(parentUid: string, name: string): Promise<string | false> {
-    try {
-      const r = await this.call('MakeDirectory', { parent_uid: parentUid, name, auth: this.auth() });
-      return r.success ? r.uid : false;
-    } catch { return false; }
+  async mkdir(parentUid: string, name: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('MakeDirectory', { parent_uid: parentUid, name, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'mkdir', parentUid); }
+    checkResponse(r, 'mkdir', parentUid);
+    return r.uid;
   }
 
-  async dir(uid: string, showDeleted = false): Promise<DirectoryEntry[] | false> {
-    try {
-      const method = showDeleted ? 'ListDirectoryWithDeleted' : 'ListDirectory';
-      const r = await this.call(method, { uid, auth: this.auth() });
-      if (!r.success) return false;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (r.entries || []).map((e: any): DirectoryEntry => ({
-        uid: e.uid,
-        name: e.name,
-        type: e.type as FileTypeName,
-        size: Number(e.size) || 0,
-        createdAt: safeDate(e.created_at),
-        modifiedAt: safeDate(e.modified_at),
-        versionCount: Number(e.version_count) || 0,
-        isContainer: e.type === 'DIRECTORY',
-        renditionCount: Number(e.rendition_count) || 0,
-        hasRenditions: (Number(e.rendition_count) || 0) > 0,
-      }));
-    } catch { return false; }
+  async dir(uid: string, showDeleted = false): Promise<DirectoryEntry[]> {
+    const method = showDeleted ? 'ListDirectoryWithDeleted' : 'ListDirectory';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call(method, { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'dir', uid); }
+    checkResponse(r, 'dir', uid, NotFoundError);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (r.entries || []).map((e: any): DirectoryEntry => ({
+      uid: e.uid,
+      name: e.name,
+      type: e.type as FileTypeName,
+      size: Number(e.size) || 0,
+      createdAt: safeDate(e.created_at),
+      modifiedAt: safeDate(e.modified_at),
+      versionCount: Number(e.version_count) || 0,
+      isContainer: e.type === 'DIRECTORY',
+      renditionCount: Number(e.rendition_count) || 0,
+      hasRenditions: (Number(e.rendition_count) || 0) > 0,
+    }));
   }
 
-  listDeleted(uid: string): Promise<DirectoryEntry[] | false> {
+  listDeleted(uid: string): Promise<DirectoryEntry[]> {
     return this.dir(uid, true);
   }
 
@@ -234,192 +258,264 @@ export class FileEngineClient {
    * hidden from normal directory listings; pass the file's UID to reveal them.
    * Equivalent to listing the file's UID directly.
    */
-  renditions(uid: string): Promise<DirectoryEntry[] | false> {
+  renditions(uid: string): Promise<DirectoryEntry[]> {
     return this.dir(uid, false);
   }
 
   // ------------------------------ file ops ----------------------------- //
-  async touch(parentUid: string, name: string): Promise<string | false> {
-    try {
-      const r = await this.call('Touch', { parent_uid: parentUid, name, auth: this.auth() });
-      return r.success ? r.uid : false;
-    } catch { return false; }
+  async touch(parentUid: string, name: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Touch', { parent_uid: parentUid, name, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'touch', parentUid); }
+    checkResponse(r, 'touch', parentUid);
+    return r.uid;
   }
 
-  async put(uid: string, payload: Buffer | string | null): Promise<number | false> {
+  async put(uid: string, payload: Buffer | string | null): Promise<number> {
     const data = payload == null ? Buffer.alloc(0) : (typeof payload === 'string' ? Buffer.from(payload) : payload);
-    try {
-      const r = await this.call('PutFile', { uid, data, auth: this.auth() });
-      return r.success ? Date.now() / 1000 : false;
-    } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('PutFile', { uid, data, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'put', uid); }
+    checkResponse(r, 'put', uid);
+    return Date.now() / 1000;
   }
 
-  async get(uid: string, back = 0): Promise<Buffer | false> {
-    try {
-      if (back === 0) {
-        const r = await this.call('GetFile', { uid, auth: this.auth() });
-        return r.success ? Buffer.from(r.data) : false;
-      }
-      const versions = await this.revisions(uid);
-      if (versions.length <= back) return false;
-      const r = await this.call('GetVersion', { uid, version_timestamp: versions[back].version, auth: this.auth() });
-      return r.success ? Buffer.from(r.data) : false;
-    } catch { return false; }
+  async get(uid: string, back = 0): Promise<Buffer> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    if (back === 0) {
+      try { r = await this.call('GetFile', { uid, auth: this.auth() }); }
+      catch (e) { raiseRpc(e as grpc.ServiceError, 'get', uid); }
+      checkResponse(r, 'get', uid, NotFoundError);
+      return Buffer.from(r.data);
+    }
+    const versions = await this.revisions(uid);
+    if (versions.length <= back) {
+      throw new NotFoundError(`version ${back} back does not exist`, { operation: 'get', uid });
+    }
+    try { r = await this.call('GetVersion', { uid, version_timestamp: versions[back].version, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'get', uid); }
+    checkResponse(r, 'get', uid, NotFoundError);
+    return Buffer.from(r.data);
   }
 
+  /**
+   * Return true if the entity exists, false if it does not. Non-existence is a
+   * normal answer; an actual failure (unreachable, read-only, auth) throws.
+   */
   async exists(uid: string): Promise<boolean> {
-    try {
-      const r = await this.call('Exists', { uid, auth: this.auth() });
-      return Boolean(r.success && r.exists);
-    } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Exists', { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'exists', uid); }
+    checkResponse(r, 'exists', uid);
+    return Boolean(r.exists);
   }
 
-  async stat(uid: string): Promise<FileInfo | null> {
-    try {
-      const r = await this.call('Stat', { uid, auth: this.auth() });
-      if (!r.success) return null;
-      const i = r.info;
-      return {
-        uid: i.uid,
-        name: i.name,
-        parentUid: i.parent_uid || '',
-        type: i.type as FileTypeName,
-        size: Number(i.size) || 0,
-        owner: i.owner || '',
-        permissions: Number(i.permissions) || 0,
-        createdAt: safeDate(i.created_at),
-        modifiedAt: safeDate(i.modified_at),
-        version: i.version || '',
-        isDir: i.type === 'DIRECTORY',
-        renditionCount: Number(i.rendition_count) || 0,
-        hasRenditions: (Number(i.rendition_count) || 0) > 0,
-      };
-    } catch { return null; }
+  /** Return a FileInfo for the entity; throws {@link NotFoundError} if absent. */
+  async stat(uid: string): Promise<FileInfo> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Stat', { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'stat', uid); }
+    checkResponse(r, 'stat', uid, NotFoundError);
+    const i = r.info;
+    return {
+      uid: i.uid,
+      name: i.name,
+      parentUid: i.parent_uid || '',
+      type: i.type as FileTypeName,
+      size: Number(i.size) || 0,
+      owner: i.owner || '',
+      permissions: Number(i.permissions) || 0,
+      createdAt: safeDate(i.created_at),
+      modifiedAt: safeDate(i.modified_at),
+      version: i.version || '',
+      isDir: i.type === 'DIRECTORY',
+      renditionCount: Number(i.rendition_count) || 0,
+      hasRenditions: (Number(i.rendition_count) || 0) > 0,
+    };
   }
 
+  /** True if the entity is a directory (false if it does not exist). */
   async isDir(uid: string): Promise<boolean> {
-    const info = await this.stat(uid);
-    return Boolean(info && info.isDir);
+    try { return (await this.stat(uid)).isDir; }
+    catch (e) { if (e instanceof NotFoundError) return false; throw e; }
   }
 
   async getParent(uid: string): Promise<string> {
-    const info = await this.stat(uid);
-    return info ? info.parentUid : '';
+    try { return (await this.stat(uid)).parentUid; }
+    catch (e) { if (e instanceof NotFoundError) return ''; throw e; }
   }
 
   async fileName(uid: string): Promise<string[]> {
-    const info = await this.stat(uid);
-    return info ? [info.name] : [];
+    try { return [(await this.stat(uid)).name]; }
+    catch (e) { if (e instanceof NotFoundError) return []; throw e; }
   }
 
   async getFileMtime(uid: string): Promise<Date | null> {
-    const info = await this.stat(uid);
-    return info ? info.modifiedAt : null;
+    try { return (await this.stat(uid)).modifiedAt; }
+    catch (e) { if (e instanceof NotFoundError) return null; throw e; }
   }
 
   async getFolderCdate(uid: string): Promise<Date | null> {
-    const info = await this.stat(uid);
-    return info ? info.createdAt : null;
+    try { return (await this.stat(uid)).createdAt; }
+    catch (e) { if (e instanceof NotFoundError) return null; throw e; }
   }
 
   // -------------------------- manipulation ----------------------------- //
   async rename(uid: string, newName: string): Promise<boolean> {
-    try { return (await this.call('Rename', { uid, new_name: newName, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Rename', { uid, new_name: newName, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'rename', uid); }
+    checkResponse(r, 'rename', uid);
+    return true;
   }
 
   async move(sourceUid: string, destinationUid: string, newName?: string): Promise<boolean> {
-    try {
-      const r = await this.call('Move', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() });
-      if (r.success && newName) return this.rename(sourceUid, newName);
-      return r.success;
-    } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Move', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'move', sourceUid); }
+    checkResponse(r, 'move', sourceUid);
+    if (newName) await this.rename(sourceUid, newName);
+    return true;
   }
 
   async copy(sourceUid: string, destinationUid: string): Promise<boolean> {
-    try { return (await this.call('Copy', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('Copy', { source_uid: sourceUid, destination_parent_uid: destinationUid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'copy', sourceUid); }
+    checkResponse(r, 'copy', sourceUid);
+    return true;
   }
 
   async remove(uid: string): Promise<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
     try {
       const info = await this.call('Stat', { uid, auth: this.auth() });
       if (info.success && info.info.type === 'DIRECTORY') {
-        return (await this.call('RemoveDirectory', { uid, auth: this.auth() })).success;
+        r = await this.call('RemoveDirectory', { uid, auth: this.auth() });
+      } else {
+        r = await this.call('RemoveFile', { uid, auth: this.auth() });
       }
-      return (await this.call('RemoveFile', { uid, auth: this.auth() })).success;
-    } catch { return false; }
+    } catch (e) { raiseRpc(e as grpc.ServiceError, 'remove', uid); }
+    checkResponse(r, 'remove', uid);
+    return true;
   }
 
   async undeleteFile(uid: string): Promise<boolean> {
-    try { return (await this.call('UndeleteFile', { uid, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('UndeleteFile', { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'undeleteFile', uid); }
+    checkResponse(r, 'undeleteFile', uid);
+    return true;
   }
 
   // ------------------------------ versions ----------------------------- //
   async revisions(uid: string): Promise<Revision[]> {
-    try {
-      const r = await this.call('ListVersions', { uid, auth: this.auth() });
-      if (!r.success) return [];
-      return (r.versions || []).map((ts: string): Revision => ({ version: ts, name: uid, user: this.user }));
-    } catch { return []; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('ListVersions', { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'revisions', uid); }
+    checkResponse(r, 'revisions', uid, NotFoundError);
+    return (r.versions || []).map((ts: string): Revision => ({ version: ts, name: uid, user: this.user }));
   }
 
-  async restoreToVersion(uid: string, versionTimestamp: string): Promise<string | false> {
-    try {
-      const r = await this.call('RestoreToVersion', { uid, version_timestamp: versionTimestamp, auth: this.auth() });
-      return r.success ? r.restored_version : false;
-    } catch { return false; }
+  async restoreToVersion(uid: string, versionTimestamp: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('RestoreToVersion', { uid, version_timestamp: versionTimestamp, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'restoreToVersion', uid); }
+    checkResponse(r, 'restoreToVersion', uid);
+    return r.restored_version;
   }
 
   async purgeOldVersions(uid: string, keepCount: number): Promise<boolean> {
-    try { return (await this.call('PurgeOldVersions', { uid, keep_count: keepCount, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('PurgeOldVersions', { uid, keep_count: keepCount, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'purgeOldVersions', uid); }
+    checkResponse(r, 'purgeOldVersions', uid);
+    return true;
   }
 
   // ------------------------------ metadata ----------------------------- //
   async setMetadataValue(uid: string, key: string, value: string): Promise<boolean> {
-    try { return (await this.call('SetMetadata', { uid, key, value, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('SetMetadata', { uid, key, value, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'setMetadataValue', uid); }
+    checkResponse(r, 'setMetadataValue', uid);
+    return true;
   }
 
-  async getMetadataValue(uid: string, key: string): Promise<string | null> {
-    try { const r = await this.call('GetMetadata', { uid, key, auth: this.auth() }); return r.success ? r.value : null; }
-    catch { return null; }
+  async getMetadataValue(uid: string, key: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetMetadata', { uid, key, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getMetadataValue', uid); }
+    checkResponse(r, 'getMetadataValue', uid, NotFoundError);
+    return r.value;
   }
 
   async getMetadataValues(uid: string): Promise<{ [k: string]: string }> {
-    try { const r = await this.call('GetAllMetadata', { uid, auth: this.auth() }); return r.success ? (r.metadata || {}) : {}; }
-    catch { return {}; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetAllMetadata', { uid, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getMetadataValues', uid); }
+    checkResponse(r, 'getMetadataValues', uid, NotFoundError);
+    return r.metadata || {};
   }
 
   async deleteMetadataValue(uid: string, key: string): Promise<boolean> {
-    try { return (await this.call('DeleteMetadata', { uid, key, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('DeleteMetadata', { uid, key, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'deleteMetadataValue', uid); }
+    checkResponse(r, 'deleteMetadataValue', uid);
+    return true;
   }
 
-  async getMetadataForVersion(uid: string, version: string, key: string): Promise<string | null> {
-    try { const r = await this.call('GetMetadataForVersion', { uid, version_timestamp: String(version), key, auth: this.auth() }); return r.success ? r.value : null; }
-    catch { return null; }
+  async getMetadataForVersion(uid: string, version: string, key: string): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetMetadataForVersion', { uid, version_timestamp: String(version), key, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getMetadataForVersion', uid); }
+    checkResponse(r, 'getMetadataForVersion', uid, NotFoundError);
+    return r.value;
   }
 
   async getAllMetadataForVersion(uid: string, version: string): Promise<{ [k: string]: string }> {
-    try { const r = await this.call('GetAllMetadataForVersion', { uid, version_timestamp: String(version), auth: this.auth() }); return r.success ? (r.metadata || {}) : {}; }
-    catch { return {}; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetAllMetadataForVersion', { uid, version_timestamp: String(version), auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getAllMetadataForVersion', uid); }
+    checkResponse(r, 'getAllMetadataForVersion', uid, NotFoundError);
+    return r.metadata || {};
   }
 
   // --------------------------- permissions ----------------------------- //
   // `claims` lets CLAIM-type (ABAC) rules match — pass the requester's auth
   // claims (key->value). Omit for plain user/role checks.
   async checkPermission(resourceUid: string, permission: PermissionName | string, user?: string, roles?: string[], claims?: { [k: string]: string }): Promise<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
     try {
-      const r = await this.call('CheckPermission', {
+      r = await this.call('CheckPermission', {
         resource_uid: resourceUid,
         required_permission: coercePermission(permission),
         auth: this.auth(user, roles, undefined, claims),
       });
-      return Boolean(r.success && r.has_permission);
-    } catch { return false; }
+    } catch (e) { raiseRpc(e as grpc.ServiceError, 'checkPermission', resourceUid); }
+    checkResponse(r, 'checkPermission', resourceUid);
+    return Boolean(r.has_permission);
   }
 
   /**
@@ -435,82 +531,132 @@ export class FileEngineClient {
     roles?: string[],
     claims?: { [k: string]: string },
   ): Promise<PermissionName[]> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
     try {
-      const r = await this.call('GetEffectivePermissions', {
+      r = await this.call('GetEffectivePermissions', {
         resource_uid: resourceUid,
         auth: this.auth(user, roles, undefined, claims),
       });
-      if (!r.success) return [];
-      return (r.permissions || []) as PermissionName[];
-    } catch { return []; }
+    } catch (e) { raiseRpc(e as grpc.ServiceError, 'getEffectivePermissions', resourceUid); }
+    checkResponse(r, 'getEffectivePermissions', resourceUid);
+    return (r.permissions || []) as PermissionName[];
   }
 
   async grantPermission(resourceUid: string, principal: string, permission: PermissionName | string, effect: AclEffectName | string = 'ALLOW'): Promise<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
     try {
-      return (await this.call('GrantPermission', {
+      r = await this.call('GrantPermission', {
         resource_uid: resourceUid, principal,
         permission: coercePermission(permission), effect: coerceEffect(effect),
         auth: this.auth(),
-      })).success;
-    } catch { return false; }
+      });
+    } catch (e) { raiseRpc(e as grpc.ServiceError, 'grantPermission', resourceUid); }
+    checkResponse(r, 'grantPermission', resourceUid);
+    return true;
   }
 
   async revokePermission(resourceUid: string, principal: string, permission: PermissionName | string, effect: AclEffectName | string = 'ALLOW'): Promise<boolean> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
     try {
-      return (await this.call('RevokePermission', {
+      r = await this.call('RevokePermission', {
         resource_uid: resourceUid, principal,
         permission: coercePermission(permission), effect: coerceEffect(effect),
         auth: this.auth(),
-      })).success;
-    } catch { return false; }
+      });
+    } catch (e) { raiseRpc(e as grpc.ServiceError, 'revokePermission', resourceUid); }
+    checkResponse(r, 'revokePermission', resourceUid);
+    return true;
   }
 
   // ------------------------------- roles ------------------------------- //
   async createRole(role: string): Promise<boolean> {
-    try { return (await this.call('CreateRole', { role, auth: this.auth() })).success; } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('CreateRole', { role, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'createRole'); }
+    checkResponse(r, 'createRole');
+    return true;
   }
 
   async deleteRole(role: string): Promise<boolean> {
-    try { return (await this.call('DeleteRole', { role, auth: this.auth() })).success; } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('DeleteRole', { role, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'deleteRole'); }
+    checkResponse(r, 'deleteRole');
+    return true;
   }
 
   async assignUserToRole(targetUser: string, role: string): Promise<boolean> {
-    try { return (await this.call('AssignUserToRole', { user: targetUser, role, auth: this.auth() })).success; } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('AssignUserToRole', { user: targetUser, role, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'assignUserToRole'); }
+    checkResponse(r, 'assignUserToRole');
+    return true;
   }
 
   async removeUserFromRole(targetUser: string, role: string): Promise<boolean> {
-    try { return (await this.call('RemoveUserFromRole', { user: targetUser, role, auth: this.auth() })).success; } catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('RemoveUserFromRole', { user: targetUser, role, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'removeUserFromRole'); }
+    checkResponse(r, 'removeUserFromRole');
+    return true;
   }
 
   async getRolesForUser(targetUser: string): Promise<string[]> {
-    try { const r = await this.call('GetRolesForUser', { user: targetUser, auth: this.auth() }); return r.success ? (r.roles || []) : []; } catch { return []; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetRolesForUser', { user: targetUser, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getRolesForUser'); }
+    checkResponse(r, 'getRolesForUser');
+    return r.roles || [];
   }
 
   async getUsersForRole(role: string): Promise<string[]> {
-    try { const r = await this.call('GetUsersForRole', { role, auth: this.auth() }); return r.success ? (r.users || []) : []; } catch { return []; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetUsersForRole', { role, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getUsersForRole'); }
+    checkResponse(r, 'getUsersForRole');
+    return r.users || [];
   }
 
   async getAllRoles(): Promise<string[]> {
-    try { const r = await this.call('GetAllRoles', { auth: this.auth() }); return r.success ? (r.roles || []) : []; } catch { return []; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetAllRoles', { auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getAllRoles'); }
+    checkResponse(r, 'getAllRoles');
+    return r.roles || [];
   }
 
   // --------------------------- administrative -------------------------- //
-  async getStorageUsage(): Promise<StorageUsage | null> {
-    try {
-      const r = await this.call('GetStorageUsage', { auth: this.auth(), tenant: this.tenant });
-      if (!r.success) return null;
-      return {
-        totalSpace: Number(r.total_space) || 0,
-        usedSpace: Number(r.used_space) || 0,
-        availableSpace: Number(r.available_space) || 0,
-        usagePercentage: Number(r.usage_percentage) || 0,
-      };
-    } catch { return null; }
+  async getStorageUsage(): Promise<StorageUsage> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('GetStorageUsage', { auth: this.auth(), tenant: this.tenant }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'getStorageUsage'); }
+    checkResponse(r, 'getStorageUsage');
+    return {
+      totalSpace: Number(r.total_space) || 0,
+      usedSpace: Number(r.used_space) || 0,
+      availableSpace: Number(r.available_space) || 0,
+      usagePercentage: Number(r.usage_percentage) || 0,
+    };
   }
 
   async triggerSync(): Promise<boolean> {
-    try { return (await this.call('TriggerSync', { tenant: this.tenant, auth: this.auth() })).success; }
-    catch { return false; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    try { r = await this.call('TriggerSync', { tenant: this.tenant, auth: this.auth() }); }
+    catch (e) { raiseRpc(e as grpc.ServiceError, 'triggerSync'); }
+    checkResponse(r, 'triggerSync');
+    return true;
   }
 }
 

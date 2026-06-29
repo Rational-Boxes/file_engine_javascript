@@ -8,7 +8,10 @@
  *
  * Run:  node test_client.js  [server_address]
  */
-const { FileEngineClient, ZERO_UID } = require('./dist/fileengine_grpc_client');
+const {
+  FileEngineClient, ZERO_UID,
+  FileEngineError, NotFoundError,
+} = require('./dist/fileengine_grpc_client');
 
 const SERVER = process.argv[2] || 'localhost:50051';
 let pass = 0, fail = 0;
@@ -16,6 +19,12 @@ const failures = [];
 function ok(cond, msg) {
   if (cond) { pass++; console.log('  \x1b[32m✓\x1b[0m ' + msg); }
   else { fail++; failures.push(msg); console.log('  \x1b[31m✗\x1b[0m ' + msg); }
+}
+
+// Assert an async operation rejects with the expected error class.
+async function throws(fn, errType, msg) {
+  try { await fn(); ok(false, msg + ' (no throw)'); }
+  catch (e) { ok(e instanceof errType, msg + (e instanceof errType ? '' : ` (got ${e && e.constructor && e.constructor.name})`)); }
 }
 
 async function main() {
@@ -67,8 +76,8 @@ async function main() {
   // subtree guard
   const guard = await admin.mkdir(ws, 'guard');
   const gchild = await admin.mkdir(guard, 'child');
-  ok((await admin.copy(guard, gchild)) === false, 'copy dir into own subtree rejected');
-  ok((await admin.move(guard, gchild)) === false, 'move dir into own subtree rejected');
+  await throws(() => admin.copy(guard, gchild), FileEngineError, 'copy dir into own subtree rejected');
+  await throws(() => admin.move(guard, gchild), FileEngineError, 'move dir into own subtree rejected');
   ok((await admin.getStorageUsage()) !== null, 'server alive after guard');
 
   // recursive dir copy
@@ -112,7 +121,7 @@ async function main() {
   ok((await admin.getAllMetadataForVersion(mf, 'current')).color === 'blue', 'allMetadataForVersion current');
   ok((await admin.getMetadataForVersion(mf, 'current', 'color')) === 'blue', 'metadataForVersion current');
   ok(await admin.deleteMetadataValue(mf, 'color'), 'deleteMetadata');
-  ok((await admin.getMetadataValue(mf, 'color')) === null, 'metadata removed');
+  await throws(() => admin.getMetadataValue(mf, 'color'), NotFoundError, 'metadata removed -> NotFoundError');
 
   // [4] permissions / ACL
   console.log('[4] Permissions / ACL');
@@ -170,9 +179,23 @@ async function main() {
   console.log('[6] Diagnostics');
   ok(await admin.triggerSync(), 'triggerSync');
 
-  // cleanup
-  await admin.remove(ws);
-  await admin.remove(zdir);
+  // [7] typed exceptions
+  console.log('[7] Typed exceptions');
+  const bogus = 'deadbeef-0000-0000-0000-000000000000';
+  await throws(() => admin.stat(bogus), NotFoundError, 'stat missing -> NotFoundError');
+  await throws(() => admin.get(bogus), NotFoundError, 'get missing -> NotFoundError');
+  ok((await admin.exists(bogus)) === false, 'exists false for bogus (no throw)');
+  ok((await admin.isDir(bogus)) === false, 'isDir false for bogus (no throw)');
+  try {
+    await admin.stat(bogus);
+  } catch (e) {
+    ok(e.operation === 'stat' && e.uid === bogus && e.transient === false,
+       'NotFoundError carries operation/uid/transient context');
+  }
+
+  // cleanup (best-effort: removing a non-empty dir is rejected -> throws)
+  try { await admin.remove(ws); } catch (e) { if (!(e instanceof FileEngineError)) throw e; }
+  try { await admin.remove(zdir); } catch (e) { if (!(e instanceof FileEngineError)) throw e; }
   admin.close();
 
   console.log('==========================================================');

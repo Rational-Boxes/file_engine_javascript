@@ -54,6 +54,45 @@ async function example() {
 example();
 ```
 
+## Error handling
+
+Methods **reject with a typed error on failure** rather than resolving to a
+falsy value. Every error derives from `FileEngineError` and carries structured
+context (`operation`, `uid`, `statusCode`, `serverError`, `transient`):
+
+| Error | Thrown when |
+|-------|-------------|
+| `ServerUnreachableError` | the server can't be reached / timed out *(transient)* |
+| `ServiceUnavailableError` | the server is up but can't serve the request *(transient)* |
+| `WriteUnavailableError` | a **write** was rejected because the server is temporarily read-only during a primary-database failover *(transient)* — retry once the primary recovers |
+| `AuthenticationError` | the identity could not be authenticated |
+| `PermissionDeniedError` | authenticated but not authorized |
+| `NotFoundError` | the entity / version / metadata key does not exist |
+| `AlreadyExistsError` | the target already exists |
+| `InvalidRequestError` | the request was rejected as invalid |
+| `OperationError` | any other server-reported failure |
+
+`WriteUnavailableError` extends `ServiceUnavailableError` extends
+`FileEngineError`. Use the `transient` flag to decide whether to retry:
+
+```typescript
+import { FileEngineClient, WriteUnavailableError, NotFoundError } from 'fileengine-grpc-client';
+
+try {
+  await client.put(fileUid, Buffer.from('new content'));
+} catch (e) {
+  if (e instanceof WriteUnavailableError) {
+    // e.transient === true — primary-DB failover; safe to retry later
+    scheduleRetry(fileUid);
+  } else if (e instanceof NotFoundError) {
+    // the file is gone
+  } else { throw e; }
+}
+
+// Existence/permission predicates still resolve (no throw) for the negative case:
+if (await client.exists(fileUid)) { /* ... */ }   // false when absent
+```
+
 ## API Reference
 
 ### Constructor
