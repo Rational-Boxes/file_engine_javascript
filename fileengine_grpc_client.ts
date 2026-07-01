@@ -86,6 +86,12 @@ export interface DirectoryEntry {
   hasRenditions: boolean;
   /** Soft-deleted; only ever true in a with-deleted listing (dir(uid, true) / listDeleted). */
   deleted: boolean;
+  /** Owning user (from the metadata DB). */
+  owner: string;
+  /** Creator = first revision author (falls back to owner). */
+  createdBy: string;
+  /** Latest reviser = last revision author (falls back to owner). */
+  modifiedBy: string;
 }
 
 export interface Revision {
@@ -249,6 +255,9 @@ export class FileEngineClient {
       renditionCount: Number(e.rendition_count) || 0,
       hasRenditions: (Number(e.rendition_count) || 0) > 0,
       deleted: e.deleted === true,
+      owner: e.owner || '',
+      createdBy: e.created_by || '',
+      modifiedBy: e.modified_by || '',
     }));
   }
 
