@@ -84,6 +84,8 @@ export interface DirectoryEntry {
   renditionCount: number;
   /** True if this file entry has hidden renditions. */
   hasRenditions: boolean;
+  /** Soft-deleted; only ever true in a with-deleted listing (dir(uid, true) / listDeleted). */
+  deleted: boolean;
 }
 
 export interface Revision {
@@ -246,6 +248,7 @@ export class FileEngineClient {
       isContainer: e.type === 'DIRECTORY',
       renditionCount: Number(e.rendition_count) || 0,
       hasRenditions: (Number(e.rendition_count) || 0) > 0,
+      deleted: e.deleted === true,
     }));
   }
 

@@ -95,8 +95,12 @@ async function main() {
   await admin.put(gone, 'bye');
   ok(await admin.remove(gone), 'soft delete file');
   ok(!(await admin.dir(delbox)).some(e => e.name === 'gone.txt'), 'ls hides deleted');
-  ok((await admin.listDeleted(delbox)).some(e => e.name === 'gone.txt'), 'lsd shows deleted');
+  const lsd = await admin.listDeleted(delbox);
+  ok(lsd.some(e => e.name === 'gone.txt'), 'lsd shows deleted');
+  ok(lsd.find(e => e.name === 'gone.txt').deleted === true, 'lsd marks entry deleted');
   ok(await admin.undeleteFile(gone), 'undelete');
+  const afterUndel = await admin.listDeleted(delbox);
+  ok(afterUndel.find(e => e.name === 'gone.txt').deleted === false, 'undeleted entry no longer marked');
   ok((await admin.dir(delbox)).some(e => e.name === 'gone.txt'), 'ls shows undeleted');
 
   // [2] versioning
