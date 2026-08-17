@@ -108,7 +108,7 @@ All operations require an authentication context with:
 - `claims`: Additional user claims (optional)
 
 > This client targets the `fileengine` protocol defined in
-> `file_engine_cpp/proto/fileservice.proto`. Method names mirror the service
+> `file_engine_core/proto/fileservice.proto`. Method names mirror the service
 > RPCs (`CreateFile`, `WriteFile`, `ReadFile`, `MoveFile`, etc.).
 
 ### Directory Operations
