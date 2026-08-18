@@ -97,6 +97,13 @@ export interface DirectoryEntry {
 export interface Revision {
   version: string;
   name: string;
+  /**
+   * Who uploaded THIS version, as recorded by the core.
+   *
+   * This used to be filled with the *calling* user, so every version appeared to
+   * have been uploaded by whoever was listing them — a confident wrong answer.
+   * Empty when the core has no record for that version.
+   */
   user: string;
 }
 
@@ -437,7 +444,20 @@ export class FileEngineClient {
     try { r = await this.call('ListVersions', { uid, auth: this.auth() }); }
     catch (e) { raiseRpc(e as grpc.ServiceError, 'revisions', uid); }
     checkResponse(r, 'revisions', uid, NotFoundError);
-    return (r.versions || []).map((ts: string): Revision => ({ version: ts, name: uid, user: this.user }));
+    // Prefer `entries`, which carries the uploader. `versions` is the older
+    // timestamp-only field, still populated by the core; falling back to it keeps
+    // this working against a core that predates the change — with an empty user
+    // rather than a wrong one.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const entries: any[] = r.entries || [];
+    if (entries.length) {
+      return entries.map((e): Revision => ({
+        version: e.version_timestamp,
+        name: uid,
+        user: e.revised_by || '',
+      }));
+    }
+    return (r.versions || []).map((ts: string): Revision => ({ version: ts, name: uid, user: '' }));
   }
 
   async restoreToVersion(uid: string, versionTimestamp: string): Promise<string> {
