@@ -386,17 +386,21 @@ export class FileEngineClient {
   }
 
   /**
-   * Yield the current version's content as it arrives, without accumulating the
-   * whole file. The counterpart to `putStream`.
+   * Yield a version's content as it arrives, without accumulating the whole
+   * file; `version` empty means the current one. The counterpart to `putStream`.
+   *
+   * Prefer this over `get(uid, back)` for a specific version: that falls back
+   * to the unary `GetVersion`, which is capped by the message limit.
    *
    * Caveat that is not this client's to fix: the core writes one gRPC message
    * per chunk its storage layer produces, and that is sometimes the entire
    * file — so the server may still emit one very large message regardless of
    * what this does. Bounding it needs the core to chunk its storage reads.
    */
-  async *getStream(uid: string): AsyncGenerator<Buffer, void, unknown> {
+  async *getStream(uid: string, version = ''): AsyncGenerator<Buffer, void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const stream: any = this.client.StreamFileDownload({ uid, auth: this.auth() });
+    const stream: any = this.client.StreamFileDownload(
+      { uid, version_timestamp: version, auth: this.auth() });
     const queue: Buffer[] = [];
     let done = false;
     let failed: unknown = null;
