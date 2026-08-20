@@ -173,6 +173,15 @@ const packageDefinition = protoLoader.loadSync(resolveProtoPath(), {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const proto: any = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
 
+/** Largest gRPC message either direction. Matches the core server and the
+ *  Python client so no peer is the odd one out. */
+export const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+/** Largest body chunk placed in a single message. Bounded on purpose: a
+ *  multi-megabyte message monopolises the connection, so content moves as a
+ *  series of small messages rather than one large one. */
+export const MAX_WIRE_CHUNK = 4 * 1024 * 1024;
+
 /**
  * High-level FileEngine client, equivalent to the Python `ManagedFiles`.
  * Stores a default user/roles/tenant/claims used for every call (overridable
@@ -201,6 +210,15 @@ export class FileEngineClient {
     this.client = new proto.FileService(
       opts.serverAddress || 'localhost:50051',
       grpc.credentials.createInsecure(),
+      {
+        // grpc-js defaults to a 4 MiB RECEIVE limit, which is far below what
+        // this platform stores and below what the core is willing to send
+        // (server.cpp sets 64 MiB both ways). Left unset, a client could store
+        // a file it was then unable to read back. Matched to the server, and to
+        // the Python client, so all three agree on the ceiling.
+        'grpc.max_receive_message_length': MAX_MESSAGE_BYTES,
+        'grpc.max_send_message_length': MAX_MESSAGE_BYTES,
+      },
     );
   }
 
@@ -299,6 +317,111 @@ export class FileEngineClient {
     catch (e) { raiseRpc(e as grpc.ServiceError, 'put', uid); }
     checkResponse(r, 'put', uid);
     return Date.now() / 1000;
+  }
+
+  /**
+   * Write a new version from an async iterable of chunks, without ever holding
+   * the whole file in memory.
+   *
+   * `put()` sends the payload in one `PutFile` message, so it is bounded by the
+   * message limit and by the caller's memory. This uses the client-streaming
+   * `StreamFileUpload` RPC — the same one the C++ http_bridge has always used —
+   * so the core pulls chunks straight into its storage writer.
+   *
+   * **Chunking is enforced, not offered.** Whatever sizes the caller yields,
+   * this re-splits them so no single message exceeds `chunkSize`. Handing over
+   * one large buffer is the natural thing to do and would otherwise produce
+   * exactly the oversized message streaming exists to avoid.
+   *
+   * Wire protocol, matching the bridge's client: the FIRST message carries
+   * `uid` + `auth` plus the first body chunk; later messages carry data only.
+   * An empty source still sends one message with `uid` + `auth`, so the server
+   * has a target and writes an empty version rather than erroring.
+   */
+  async putStream(
+    uid: string,
+    chunks: AsyncIterable<Buffer | Uint8Array | string> | Iterable<Buffer | Uint8Array | string>,
+    chunkSize: number = MAX_WIRE_CHUNK,
+  ): Promise<number> {
+    const limit = Math.max(1, chunkSize);
+    const auth = this.auth();
+
+    return new Promise<number>((resolve, reject) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stream: any = this.client.StreamFileUpload(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (err: grpc.ServiceError | null, response: any) => {
+          if (err) { try { raiseRpc(err, 'putStream', uid); } catch (e) { reject(e); } return; }
+          try { checkResponse(response, 'putStream', uid); } catch (e) { reject(e); return; }
+          resolve(Date.now() / 1000);
+        },
+      );
+
+      (async () => {
+        let first = true;
+        try {
+          for await (const raw of chunks as AsyncIterable<Buffer | Uint8Array | string>) {
+            if (raw == null) continue;
+            const buf = typeof raw === 'string' ? Buffer.from(raw) : Buffer.from(raw);
+            if (buf.length === 0) continue;   // would end nothing early
+            for (let off = 0; off < buf.length; off += limit) {
+              const piece = buf.subarray(off, Math.min(off + limit, buf.length));
+              const msg = first
+                ? { uid, auth, data: piece }
+                : { data: piece };
+              first = false;
+              if (!stream.write(msg)) {
+                await new Promise<void>((r) => stream.once('drain', r));
+              }
+            }
+          }
+          if (first) stream.write({ uid, auth });
+          stream.end();
+        } catch (e) {
+          stream.destroy(e as Error);
+          reject(e);
+        }
+      })();
+    });
+  }
+
+  /**
+   * Yield the current version's content as it arrives, without accumulating the
+   * whole file. The counterpart to `putStream`.
+   *
+   * Caveat that is not this client's to fix: the core writes one gRPC message
+   * per chunk its storage layer produces, and that is sometimes the entire
+   * file — so the server may still emit one very large message regardless of
+   * what this does. Bounding it needs the core to chunk its storage reads.
+   */
+  async *getStream(uid: string): AsyncGenerator<Buffer, void, unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stream: any = this.client.StreamFileDownload({ uid, auth: this.auth() });
+    const queue: Buffer[] = [];
+    let done = false;
+    let failed: unknown = null;
+    let wake: (() => void) | null = null;
+    const bump = () => { const w = wake; wake = null; if (w) w(); };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    stream.on('data', (resp: any) => {
+      try { checkResponse(resp, 'getStream', uid, NotFoundError); }
+      catch (e) { failed = e; stream.destroy(); bump(); return; }
+      if (resp.data && resp.data.length) queue.push(Buffer.from(resp.data));
+      bump();
+    });
+    stream.on('error', (err: grpc.ServiceError) => {
+      try { raiseRpc(err, 'getStream', uid); } catch (e) { failed = e; }
+      done = true; bump();
+    });
+    stream.on('end', () => { done = true; bump(); });
+
+    for (;;) {
+      while (queue.length) yield queue.shift() as Buffer;
+      if (failed) throw failed;
+      if (done) return;
+      await new Promise<void>((r) => { wake = r; });
+    }
   }
 
   async get(uid: string, back = 0): Promise<Buffer> {
