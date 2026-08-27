@@ -43,7 +43,15 @@ export type FileTypeName = 'REGULAR_FILE' | 'DIRECTORY' | 'SYMLINK';
 export type PermissionName =
   | 'READ' | 'WRITE' | 'DELETE' | 'LIST_DELETED' | 'UNDELETE' | 'VIEW_VERSIONS'
   | 'RETRIEVE_BACK_VERSION' | 'RESTORE_TO_VERSION' | 'EXECUTE' | 'MANAGE_ACL'
-  | 'ACL_INHERIT';
+  | 'ACL_INHERIT'
+  // The two destroy-data bits. Neither has a single-letter alias, and neither is
+  // conferred by the core's tenant_admin bypass — both must be granted
+  // explicitly. ERASE additionally does not inherit to descendants.
+  //
+  // They are typed here because this SDK is a trusted server-side caller, not a
+  // document client: the surface restriction in the core's proposal (§5.4.9)
+  // excludes WebDAV and CMIS, not an SDK holding the core's own identity.
+  | 'CULL_VERSIONS' | 'ERASE';
 export type AclEffectName = 'ALLOW' | 'DENY';
 
 export interface AuthenticationContext {
