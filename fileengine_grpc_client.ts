@@ -181,6 +181,24 @@ const packageDefinition = protoLoader.loadSync(resolveProtoPath(), {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const proto: any = grpc.loadPackageDefinition(packageDefinition).fileengine_rpc;
 
+/** Read this process's service credential. File wins over the env var. */
+function readServiceToken(): string {
+  const path = (process.env.FILEENGINE_SERVICE_TOKEN_FILE || '').trim();
+  if (path) {
+    try {
+      // Trimmed: a file written by a shell almost always ends in a newline, and
+      // a token with a trailing newline authenticates as nobody with nothing in
+      // the error to say why.
+      const fromFile = fs.readFileSync(path, 'utf8').split('\n')[0].trim();
+      if (fromFile) return fromFile;
+    } catch {
+      // Fall through to the environment: a missing file at startup is a
+      // legitimate configuration when the env var is set instead.
+    }
+  }
+  return (process.env.FILEENGINE_SERVICE_TOKEN || '').trim();
+}
+
 /** Largest gRPC message either direction. Matches the core server and the
  *  Python client so no peer is the odd one out. */
 export const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
@@ -199,6 +217,9 @@ export const MAX_WIRE_CHUNK = 4 * 1024 * 1024;
 export class FileEngineClient {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private client: any;
+  /** Empty when no credential is configured, which keeps the SDK usable during
+   *  the migration and against a core that does not require service auth. */
+  private serviceToken = '';
   private user: string;
   private roles: string[];
   private tenant: string;
@@ -215,6 +236,7 @@ export class FileEngineClient {
     } else if (opts.userClaims) {
       this.claims = { ...opts.userClaims };
     }
+    this.serviceToken = readServiceToken();
     this.client = new proto.FileService(
       opts.serverAddress || 'localhost:50051',
       grpc.credentials.createInsecure(),
@@ -249,12 +271,40 @@ export class FileEngineClient {
     };
   }
 
+  /**
+   * The calling service's credential, carried on every RPC in call metadata.
+   *
+   * See `file_engine_core/design_documents/PROPOSAL_service_authentication.md`.
+   * The core cannot otherwise tell which internal service is calling it, so
+   * `source_iface` records the door an action came through and the core can
+   * refuse a service operations it has no business performing.
+   *
+   * **This SDK ships no token of its own.** §8.2 declines to issue the SDKs an
+   * identity — they speak gRPC directly and are safe only server-side, so
+   * minting them a credential would legitimise the weakest path. The SDK
+   * carries whatever credential the embedding service was issued.
+   *
+   * `FILEENGINE_SERVICE_TOKEN_FILE` wins over the plain variable: that is the
+   * container path, where an init writes the credential into a shared volume
+   * before the service starts, and it keeps the secret out of container
+   * metadata where an env var is visible to `docker inspect`.
+   */
+  private serviceMetadata(): grpc.Metadata {
+    const md = new grpc.Metadata();
+    if (this.serviceToken) md.set('x-fe-service-token', this.serviceToken);
+    return md;
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private call<TRes = any>(method: string, request: object): Promise<TRes> {
     return new Promise<TRes>((resolve, reject) => {
-      this.client[method](request, (err: grpc.ServiceError | null, response: TRes) => {
-        if (err) reject(err); else resolve(response);
-      });
+      // Metadata is attached here, in the one place every unary call goes
+      // through — a per-call-site attachment would eventually miss one, and the
+      // miss would be an UNAUTHENTICATED in production rather than a type error.
+      this.client[method](request, this.serviceMetadata(),
+        (err: grpc.ServiceError | null, response: TRes) => {
+          if (err) reject(err); else resolve(response);
+        });
     });
   }
 
@@ -356,7 +406,11 @@ export class FileEngineClient {
 
     return new Promise<number>((resolve, reject) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const stream: any = this.client.StreamFileUpload(
+      // Streaming carries the token too: file content moves through these, so
+    // covering only the unary calls would leave the highest-volume paths
+    // unauthenticated — and it would look like it worked, because everything
+    // else would pass.
+    const stream: any = this.client.StreamFileUpload(this.serviceMetadata(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (err: grpc.ServiceError | null, response: any) => {
           if (err) { try { raiseRpc(err, 'putStream', uid); } catch (e) { reject(e); } return; }
