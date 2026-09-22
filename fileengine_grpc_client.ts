@@ -461,8 +461,14 @@ export class FileEngineClient {
    */
   async *getStream(uid: string, version = ''): AsyncGenerator<Buffer, void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    // The credential goes here too. This was the ONE call site that omitted it —
+    // the comment on putStream above predicts exactly this ("a per-call-site
+    // attachment would eventually miss one") — so against a core with service
+    // auth required every streamed download failed UNAUTHENTICATED while uploads
+    // and unary calls worked, which reads as a core fault rather than a missing
+    // argument here.
     const stream: any = this.client.StreamFileDownload(
-      { uid, version_timestamp: version, auth: this.auth() });
+      { uid, version_timestamp: version, auth: this.auth() }, this.serviceMetadata());
     const queue: Buffer[] = [];
     let done = false;
     let failed: unknown = null;
