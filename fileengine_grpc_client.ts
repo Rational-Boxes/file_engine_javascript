@@ -20,7 +20,7 @@ import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
 import * as fs from 'fs';
-import { raiseRpc, checkResponse, NotFoundError } from './errors';
+import { raiseRpc, checkResponse, NotFoundError, InvalidRequestError } from './errors';
 
 export const ROOT_UID = '';
 export const ZERO_UID = '00000000-0000-0000-0000-000000000000';
@@ -115,6 +115,57 @@ export interface Revision {
   user: string;
 }
 
+/**
+ * A byte range over the PLAINTEXT, half-open `[offset, offset + length)`.
+ *
+ * Both are optional and both default to 0, which means "the whole file" — the
+ * same thing an untouched caller has always asked for. The range is never over
+ * stored bytes: a caller must not have to know whether the deployment
+ * compresses or encrypts.
+ */
+export interface RangeOptions {
+  /** First plaintext byte to return. Must be >= 0. */
+  offset?: number;
+  /** How many bytes; 0 (the default) means "to the end". Must be >= 0. */
+  length?: number;
+  /** Read this version instead of the current one. */
+  version?: string;
+}
+
+/**
+ * What the server said about a ranged read (storage_pipeline.md SR-12/13).
+ *
+ * On a stream this arrives on the FIRST frame and is zero on the rest, so a
+ * reader that wants it must not discard that frame.
+ */
+export interface RangeInfo {
+  /**
+   * Plaintext length of the whole version, whatever range was asked for.
+   * Worth having even for a whole-file read: answering an HTTP Range needs the
+   * total, and without this a door has to Stat first.
+   */
+  totalSize: number;
+  rangeStart: number;
+  rangeLength: number;
+  /** True only when the server actually applied a range. */
+  ranged: boolean;
+  /**
+   * `'seek'` when the cost was proportional to length, `'scan'` when it was
+   * proportional to offset+length, `''` from a server too old to say.
+   *
+   * Part of the contract rather than diagnostics: a range API that silently
+   * costs O(offset) is worse than none, because callers design against the
+   * promise instead of the behaviour.
+   */
+  rangeMethod: string;
+}
+
+/** The bytes of a ranged read, with what the server said about them. */
+export interface RangeResult {
+  data: Buffer;
+  info: RangeInfo;
+}
+
 export interface StorageUsage {
   totalSpace: number;
   usedSpace: number;
@@ -207,6 +258,40 @@ export const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
  *  multi-megabyte message monopolises the connection, so content moves as a
  *  series of small messages rather than one large one. */
 export const MAX_WIRE_CHUNK = 4 * 1024 * 1024;
+
+/**
+ * Refuse a range the server would refuse, before spending a round-trip.
+ *
+ * A range PAST the end is deliberately not rejected: whether that is empty or
+ * an error depends on the version's size, which this side does not know without
+ * a round-trip of its own, and guessing would make the client disagree with the
+ * server about a boundary case.
+ */
+function validateRange(offset: number, length: number, operation: string, uid?: string): void {
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new InvalidRequestError(`offset must be an integer >= 0, got ${offset}`, { operation, uid });
+  }
+  if (!Number.isInteger(length) || length < 0) {
+    throw new InvalidRequestError(`length must be an integer >= 0 (0 means to the end), got ${length}`, { operation, uid });
+  }
+}
+
+/** Read the range metadata off a response frame. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function rangeInfoOf(resp: any): RangeInfo {
+  return {
+    totalSize: Number(resp?.total_size ?? 0),
+    rangeStart: Number(resp?.range_start ?? 0),
+    rangeLength: Number(resp?.range_length ?? 0),
+    ranged: Boolean(resp?.ranged ?? false),
+    rangeMethod: String(resp?.range_method ?? ''),
+  };
+}
+
+/** An all-zero RangeInfo: what a whole-file read of an empty stream reports. */
+function emptyRangeInfo(): RangeInfo {
+  return { totalSize: 0, rangeStart: 0, rangeLength: 0, ranged: false, rangeMethod: '' };
+}
 
 /**
  * High-level FileEngine client, equivalent to the Python `ManagedFiles`.
@@ -459,7 +544,7 @@ export class FileEngineClient {
    * file — so the server may still emit one very large message regardless of
    * what this does. Bounding it needs the core to chunk its storage reads.
    */
-  async *getStream(uid: string, version = ''): AsyncGenerator<Buffer, void, unknown> {
+  async *getStream(uid: string, version = '', range: RangeOptions = {}): AsyncGenerator<Buffer, void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     // The credential goes here too. This was the ONE call site that omitted it —
     // the comment on putStream above predicts exactly this ("a per-call-site
@@ -467,8 +552,12 @@ export class FileEngineClient {
     // auth required every streamed download failed UNAUTHENTICATED while uploads
     // and unary calls worked, which reads as a core fault rather than a missing
     // argument here.
+    const offset = range.offset ?? 0;
+    const length = range.length ?? 0;
+    validateRange(offset, length, 'getStream', uid);
     const stream: any = this.client.StreamFileDownload(
-      { uid, version_timestamp: version, auth: this.auth() }, this.serviceMetadata());
+      { uid, version_timestamp: version, auth: this.auth(), offset, length },
+      this.serviceMetadata());
     const queue: Buffer[] = [];
     let done = false;
     let failed: unknown = null;
@@ -496,11 +585,23 @@ export class FileEngineClient {
     }
   }
 
-  async get(uid: string, back = 0): Promise<Buffer> {
+  /**
+   * Read file content. `back` selects how many versions back (0 = latest).
+   *
+   * `range` is appended and optional, so every existing call is unchanged: no
+   * range means offset 0, length 0, which the server reads as "the whole file".
+   *
+   * Use `getRange` instead when you want what the server said about the read —
+   * this returns bytes and drops the metadata.
+   */
+  async get(uid: string, back = 0, range: RangeOptions = {}): Promise<Buffer> {
+    const offset = range.offset ?? 0;
+    const length = range.length ?? 0;
+    validateRange(offset, length, 'get', uid);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let r: any;
     if (back === 0) {
-      try { r = await this.call('GetFile', { uid, auth: this.auth() }); }
+      try { r = await this.call('GetFile', { uid, auth: this.auth(), offset, length }); }
       catch (e) { raiseRpc(e as grpc.ServiceError, 'get', uid); }
       checkResponse(r, 'get', uid, NotFoundError);
       return Buffer.from(r.data);
@@ -509,10 +610,102 @@ export class FileEngineClient {
     if (versions.length <= back) {
       throw new NotFoundError(`version ${back} back does not exist`, { operation: 'get', uid });
     }
+    if (offset || length) {
+      // GetVersion is unary and carries no range fields, so a ranged read of an
+      // older version goes through the streaming RPC, which takes both a
+      // version and a range. Falling back to GetVersion here would silently
+      // return the WHOLE version instead of the slice that was asked for.
+      const chunks: Buffer[] = [];
+      for await (const c of this.getStream(uid, versions[back].version, { offset, length })) {
+        chunks.push(c);
+      }
+      return Buffer.concat(chunks);
+    }
     try { r = await this.call('GetVersion', { uid, version_timestamp: versions[back].version, auth: this.auth() }); }
     catch (e) { raiseRpc(e as grpc.ServiceError, 'get', uid); }
     checkResponse(r, 'get', uid, NotFoundError);
     return Buffer.from(r.data);
+  }
+
+  /**
+   * Read a byte range and return it WITH what the server said about it.
+   *
+   * The defaults read the whole file, so this is also how to learn a version's
+   * size and whether this deployment can seek, in one call. Read
+   * `info.rangeMethod` before building anything that seeks: a v1 payload
+   * answers `'scan'`, meaning the cost was proportional to offset+length.
+   */
+  async getRange(uid: string, range: RangeOptions = {}): Promise<RangeResult> {
+    const offset = range.offset ?? 0;
+    const length = range.length ?? 0;
+    validateRange(offset, length, 'getRange', uid);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let r: any;
+    if (!range.version) {
+      try { r = await this.call('GetFile', { uid, auth: this.auth(), offset, length }); }
+      catch (e) { raiseRpc(e as grpc.ServiceError, 'getRange', uid); }
+      checkResponse(r, 'getRange', uid, NotFoundError);
+      return { data: Buffer.from(r.data ?? Buffer.alloc(0)), info: rangeInfoOf(r) };
+    }
+    const chunks: Buffer[] = [];
+    let info: RangeInfo | null = null;
+    for await (const pair of this.getRangeStream(uid, range)) {
+      if (info === null) info = pair.info;
+      chunks.push(pair.chunk);
+    }
+    return { data: Buffer.concat(chunks), info: info ?? emptyRangeInfo() };
+  }
+
+  /**
+   * Like `getRange`, but yields chunks instead of buffering.
+   *
+   * Yields `{ info, chunk }`. `info` is the same object every time — read it
+   * from the first pair and ignore it after — so a caller streaming a large
+   * range never has to choose between the metadata and bounded memory, which is
+   * the choice `getRange` forces.
+   */
+  async *getRangeStream(
+    uid: string,
+    range: RangeOptions = {},
+  ): AsyncGenerator<{ info: RangeInfo; chunk: Buffer }, void, unknown> {
+    const offset = range.offset ?? 0;
+    const length = range.length ?? 0;
+    validateRange(offset, length, 'getRangeStream', uid);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stream: any = this.client.StreamFileDownload(
+      { uid, version_timestamp: range.version ?? '', auth: this.auth(), offset, length },
+      this.serviceMetadata());
+    const queue: Buffer[] = [];
+    let info: RangeInfo | null = null;
+    let done = false;
+    let failed: unknown = null;
+    let wake: (() => void) | null = null;
+    const bump = () => { const w = wake; wake = null; if (w) w(); };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    stream.on('data', (resp: any) => {
+      try { checkResponse(resp, 'getRangeStream', uid, NotFoundError); }
+      catch (e) { failed = e; stream.destroy(); bump(); return; }
+      // SR-12: the metadata rides the FIRST frame and is zero on the rest, so
+      // it is taken once. Reading it off every frame would leave totalSize at 0.
+      if (info === null) info = rangeInfoOf(resp);
+      if (resp.data && resp.data.length) queue.push(Buffer.from(resp.data));
+      bump();
+    });
+    stream.on('error', (err: grpc.ServiceError) => {
+      try { raiseRpc(err, 'getRangeStream', uid); } catch (e) { failed = e; }
+      done = true; bump();
+    });
+    stream.on('end', () => { done = true; bump(); });
+
+    for (;;) {
+      while (queue.length) {
+        yield { info: info ?? emptyRangeInfo(), chunk: queue.shift() as Buffer };
+      }
+      if (failed) throw failed;
+      if (done) return;
+      await new Promise<void>((r) => { wake = r; });
+    }
   }
 
   /**
